@@ -1,0 +1,23 @@
+# /etc/udev/rules.d/99-streamdeck.rules
+#
+# Elgato Stream Deck — genuine USB HID device, accessed via hidapi.
+# Without this, only root can open the hidraw node.
+#
+# Elgato vendor ID is 0fd9. Product IDs cover the family; XL is 006c/008f.
+# We match the whole vendor so a future device still works.
+#
+# After editing:
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", GROUP="plugdev", MODE="0660", \
+    TAG+="uaccess", TAG+="systemd"
+
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", GROUP="plugdev", MODE="0660", \
+    TAG+="uaccess", TAG+="systemd"
+
+# Stable symlink for the XL specifically (optional; the library enumerates
+# by USB ID anyway, but useful for BindsTo= in systemd).
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", ATTRS{idProduct}=="006c", \
+    ENV{SYSTEMD_ALIAS}="/dev/streamdeck-xl"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", ATTRS{idProduct}=="008f", \
+    ENV{SYSTEMD_ALIAS}="/dev/streamdeck-xl"

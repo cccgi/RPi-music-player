@@ -1,0 +1,24 @@
+// /etc/polkit-1/rules.d/51-rpi-player-bluetooth.rules
+//
+// Same shape as 49-rpi-player-shutdown.rules and 50-rpi-player-wifi.rules,
+// for a third D-Bus action: the Stream Deck's Bluetooth picker "Reset"
+// button (player/bt.py's reset_pairing_blocking/reset_failed_pairings_blocking)
+// falls back to `systemctl restart bluetooth` when `bluetoothctl remove`
+// alone leaves a stale on-disk pairing record behind (confirmed live: a
+// device removed via `bluetoothctl remove` still had a residual
+// /var/lib/bluetooth/<adapter>/<mac>/ record, and a fresh `pair` against
+// it failed with `org.bluez.Error.AlreadyExists` until bluetoothd itself
+// was restarted). `systemctl restart` talks to systemd over D-Bus, which
+// requires polkit authorization for org.freedesktop.systemd1.manage-units
+// -- there is no session/agent for the unattended "rpi" service account to
+// answer a password prompt, so without this rule the fallback would fail
+// exactly as silently as poweroff and Wi-Fi toggle did before their rules
+// existed. Scoped to bluetooth.service specifically, not a blanket grant
+// for every unit.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "bluetooth.service" &&
+        subject.user == "rpi") {
+        return polkit.Result.YES;
+    }
+});

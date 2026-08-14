@@ -1,0 +1,109 @@
+[Unit]
+Description=Stream Deck XL display and control for MPD
+Documentation=file:/opt/rpi-player/docs/ROADMAP.md
+
+After=mpd.service
+Wants=mpd.service
+
+# Start after the TourBox daemon so the IPC bus socket already exists when we
+# try to subscribe. The subscriber retries anyway, so this is an optimisation
+# to avoid a few seconds of reconnect noise in the journal at boot.
+After=tourbox-player.service
+
+# Never give up restarting. These MUST live in [Unit] — systemd silently
+# ignores them in [Service] with "Unknown key ... ignoring" in the journal,
+# leaving the rate limit at the default 5 starts per 10s.
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+# plugdev: open the Stream Deck hidraw node (see 99-streamdeck.rules)
+SupplementaryGroups=plugdev audio
+
+WorkingDirectory=/opt/rpi-player
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=RPI_PLAYER_HOME=/opt/rpi-player
+
+# REQUIRED for output routing. PipeWire is a per-user service with its socket
+# at /run/user/<uid>/pipewire-0. A *system* unit has no XDG_RUNTIME_DIR even
+# when it runs as that user, so wpctl and pw-dump fail with:
+#     Could not connect to PipeWire
+# The daemon keeps running and the panel looks fine, but it cannot enumerate
+# sinks — so Bluetooth and AirPlay routes silently render as unavailable.
+# Requires: loginctl enable-linger rpi
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PIPEWIRE_RUNTIME_DIR=/run/user/1000
+
+ExecStart=/opt/rpi-player/venv/bin/python -m player.streamdeck_daemon
+
+# Blank the panel on stop so a shutdown does not leave 32 keys lit.
+# A script file, NOT an inline `python -c`: systemd's line continuation keeps
+# the indentation of continued lines and Python rejects it with
+# "IndentationError: unexpected indent".
+ExecStopPost=-/opt/rpi-player/venv/bin/python /opt/rpi-player/bin/streamdeck-blank
+
+# --- Resilience -------------------------------------------------------------
+Restart=always
+RestartSec=5
+
+# --- Scheduling -------------------------------------------------------------
+# Deliberately LOWER priority than the TourBox daemon. Image compositing is
+# bursty; it must never delay a knob turn or, worse, the audio thread.
+Nice=5
+IOSchedulingClass=idle
+
+# --- Runtime directory ------------------------------------------------------
+# Declared here as well as in tourbox-player so neither service depends on the
+# other's start order to have /run/rpi-player exist.
+RuntimeDirectory=rpi-player
+RuntimeDirectoryMode=0770
+
+# --- Hardening --------------------------------------------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# /run/user/<uid> must be WRITABLE: connecting to a Unix domain socket requires
+# write permission on it, and ProtectSystem=strict mounts /run read-only.
+# Without this the daemon has the right user, the right XDG_RUNTIME_DIR and a
+# socket that exists — and still fails with "Could not connect to PipeWire".
+#
+# The '-' prefix makes each path OPTIONAL. Without it, a path that does not yet
+# exist kills startup during sandbox setup with
+#   "Failed to set up mount namespacing: ... No such file or directory"
+# which is a start-order race, not a real misconfiguration.
+#
+# /home/rpi/Music, /home/rpi/Music-trash and the deletion log ALSO need to be
+# here for the same reason /run/user/1000 does: ProtectHome=read-only mounts
+# ALL of /home read-only in this service's own private mount namespace,
+# regardless of the real filesystem's actual (rw) state or what a plain SSH
+# shell can do — an interactive shell isn't sandboxed the same way, so it
+# writes to these paths fine, which is exactly what made this look like a
+# flaky SD card/permission problem rather than a self-inflicted sandbox
+# restriction. Without these, every delete_current in "trash"/"permanent"
+# mode fails with "[Errno 30] Read-only file system", 100% reproducibly, no
+# matter how many times you press the key or restart the service — found
+# live: repeated identical failures on the exact same Music-trash subpath,
+# while a manual `touch` on the very same path via SSH worked every time.
+# /home/rpi/Video too — video_delete_current (the video page's own Delete
+# key, same cell as music's) needs to move/unlink files under the video
+# library the exact same way music's delete does under /home/rpi/Music, and
+# would hit the identical EROFS failure without this.
+#
+# Keep these in sync with config.toml's [delete] trash_dir/log_path/
+# music_dir and [video] library_dir if you ever change them from the
+# defaults.
+ReadWritePaths=-/run/rpi-player -/run/user/1000 /home/rpi/Music /home/rpi/Music-trash /home/rpi/deleted-tracks.log /home/rpi/Video
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=Force Wi-Fi radio on at boot (undo any Video-page Wi-Fi-off left from the previous run)
+Documentation=file:/opt/rpi-player/docs/CONFIGURATION.md
+# NetworkManager persists WirelessEnabled across reboots in its own state
+# file (/var/lib/NetworkManager/NetworkManager.state) -- if the Video page's
+# Wi-Fi toggle key (actions.py's toggle_wifi) was last used to turn it off,
+# NetworkManager would otherwise bring it back up ALREADY OFF next boot,
+# which defeats the point: Wi-Fi off is meant to save battery only while
+# actually on the road, not become the new permanent default. This unit
+# unconditionally forces it back on exactly once per boot, after
+# NetworkManager itself is up.
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nmcli radio wifi on
+
+[Install]
+WantedBy=multi-user.target

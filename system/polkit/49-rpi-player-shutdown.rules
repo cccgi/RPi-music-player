@@ -1,0 +1,21 @@
+// /etc/polkit-1/rules.d/49-rpi-player-shutdown.rules
+//
+// Without this, `systemctl poweroff` run as the "rpi" service account fails
+// with "Interactive authentication required" — logind requires a polkit
+// authorization that an unattended service account never has, because
+// there's no session/agent to prompt.
+//
+// The Stream Deck's own two-step confirm (press = arm, second press within
+// 5s = commit — see streamdeck_daemon.py SHUTDOWN_CONFIRM_SECONDS) is the
+// deliberate-intent gate here. A car stereo has no keyboard to type a
+// password into, so a second polkit prompt on top of that isn't a safety
+// improvement, it's just a silent failure — which is exactly what happened
+// before this rule existed: the confirm sequence ran, systemctl was denied,
+// and the key quietly went back to idle with no feedback.
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.login1.power-off" ||
+         action.id == "org.freedesktop.login1.power-off-multiple-sessions") &&
+        subject.user == "rpi") {
+        return polkit.Result.YES;
+    }
+});

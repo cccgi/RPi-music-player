@@ -1,0 +1,21 @@
+// /etc/polkit-1/rules.d/52-rpi-player-network.rules
+//
+// Same shape as 49-rpi-player-shutdown.rules, 50-rpi-player-wifi.rules, and
+// 51-rpi-player-bluetooth.rules, for a fourth D-Bus action: the AirPlay
+// picker's "Fix Wifi" key (player/wifi.py's restart_networking_blocking)
+// runs `systemctl restart NetworkManager` as the heavier fallback for
+// "iffy Wi-Fi" symptoms -- it reloads every /etc/NetworkManager/conf.d/
+// drop-in (including wifi-powersave-off.conf) and forces a full re-init of
+// the Wi-Fi stack. `systemctl restart` talks to systemd over D-Bus, which
+// requires polkit authorization for org.freedesktop.systemd1.manage-units
+// -- there is no session/agent for the unattended "rpi" service account to
+// answer a password prompt, so without this rule the button would fail
+// exactly as silently as poweroff, Wi-Fi toggle, and Bluetooth reset did
+// before their rules existed. Scoped to NetworkManager.service only.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "NetworkManager.service" &&
+        subject.user == "rpi") {
+        return polkit.Result.YES;
+    }
+});

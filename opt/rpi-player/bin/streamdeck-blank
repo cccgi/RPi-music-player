@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Blank every attached Stream Deck and release it.
+
+Called from streamdeck-player.service as ExecStopPost so a shutdown or restart
+does not leave 32 keys lit with stale content.
+
+This exists as a file rather than an inline `python -c` in the unit because
+systemd's line continuation preserves the leading whitespace of continued
+lines, which Python then rejects with "IndentationError: unexpected indent".
+Multi-line one-liners in ExecStart/ExecStopPost are a trap.
+
+Always exits 0 — failing to blank a panel must never block a service stop.
+"""
+
+from __future__ import annotations
+
+import sys
+
+
+def main() -> int:
+    try:
+        from StreamDeck.DeviceManager import DeviceManager
+    except ImportError:
+        return 0
+
+    try:
+        decks = DeviceManager().enumerate()
+    except Exception:  # noqa: BLE001 - USB enumeration can fail in many ways
+        return 0
+
+    for deck in decks:
+        try:
+            deck.open()
+            deck.reset()          # clears all key images
+            deck.set_brightness(0)
+            deck.close()
+        except Exception:  # noqa: BLE001
+            try:
+                deck.close()
+            except Exception:  # noqa: BLE001
+                pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

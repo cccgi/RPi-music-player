@@ -1,0 +1,60 @@
+# /etc/udev/rules.d/99-tourbox.rules
+#
+# TourBox controller — CDC-ACM serial device.
+#
+# Three jobs:
+#   1. Stop ModemManager probing the port with AT commands (steals our bytes).
+#   2. Create a stable /dev/tourbox symlink (never trust ttyACM0 ordering).
+#   3. Grant group access so the daemon runs unprivileged.
+#
+# ---------------------------------------------------------------------------
+# USB IDs — VERIFIED ON HARDWARE
+# ---------------------------------------------------------------------------
+#   cafe:4001  TourBox NEO      <- CONFIRMED 2026-08-08 on a real unit
+#   c251:2005  TourBox Elite / Elite Plus   (community-reported, unverified)
+#   2e3c:5740  reported for some units      (community-reported, unverified)
+#
+# Note the NEO's vendor ID is literally 0xcafe. That is not a placeholder — it
+# is a default ID from the TinyUSB stack that TourBox shipped without changing.
+# Several community drivers assume 2e3c:5740 and will never match a NEO.
+#
+# Verify yours:
+#   lsusb
+#   udevadm info -a -n /dev/ttyACM0 | grep -E 'idVendor|idProduct|product'
+#
+# After editing:
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   (then unplug/replug the TourBox)
+#
+# Verify it worked:
+#   ls -l /dev/tourbox
+
+# --- TourBox NEO (verified) -------------------------------------------------
+SUBSYSTEM=="tty", ATTRS{idVendor}=="cafe", ATTRS{idProduct}=="4001", \
+    ENV{ID_MM_DEVICE_IGNORE}="1", \
+    ENV{ID_MM_PORT_IGNORE}="1", \
+    SYMLINK+="tourbox", \
+    GROUP="dialout", MODE="0660"
+
+# --- TourBox Elite / Elite Plus --------------------------------------------
+SUBSYSTEM=="tty", ATTRS{idVendor}=="c251", ATTRS{idProduct}=="2005", \
+    ENV{ID_MM_DEVICE_IGNORE}="1", \
+    ENV{ID_MM_PORT_IGNORE}="1", \
+    SYMLINK+="tourbox", \
+    GROUP="dialout", MODE="0660"
+
+# --- Other reported IDs ----------------------------------------------------
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e3c", ATTRS{idProduct}=="5740", \
+    ENV{ID_MM_DEVICE_IGNORE}="1", \
+    ENV{ID_MM_PORT_IGNORE}="1", \
+    SYMLINK+="tourbox", \
+    GROUP="dialout", MODE="0660"
+
+# --- Belt and braces --------------------------------------------------------
+# Match on the product string so a future firmware revision that changes the
+# PID still gets the ModemManager exclusion and the symlink.
+SUBSYSTEM=="tty", ATTRS{product}=="TourBox*", \
+    ENV{ID_MM_DEVICE_IGNORE}="1", \
+    ENV{ID_MM_PORT_IGNORE}="1", \
+    SYMLINK+="tourbox", \
+    GROUP="dialout", MODE="0660"

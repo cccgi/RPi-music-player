@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""TourBox byte capture and keymap learning tool.
+
+The byte codes shipped in etc/keymap.toml are community-sourced CANDIDATES.
+TourBox has shipped multiple firmware revisions and there is no guarantee they
+match your unit. This tool records what your device actually emits.
+
+Two modes:
+
+  --sniff   Dump every byte with timestamps. Use this first to sanity-check
+            that the port works at all and to see the press/release pattern.
+
+  --learn   Guided walkthrough: prompts for each control in turn, records the
+            bytes, and writes a verified keymap.toml.
+
+Usage:
+    sudo systemctl stop tourbox-player
+    /opt/rpi-player/venv/bin/python /opt/rpi-player/bin/tourbox-capture --sniff
+    /opt/rpi-player/venv/bin/python /opt/rpi-player/bin/tourbox-capture --learn \\
+        --out /tmp/keymap.toml
+    diff /opt/rpi-player/etc/keymap.toml /tmp/keymap.toml
+    sudo cp /tmp/keymap.toml /opt/rpi-player/etc/keymap.toml
+    sudo systemctl start tourbox-player
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import select
+import sys
+import time
+from pathlib import Path
+
+try:
+    import serial
+except ImportError:
+    sys.exit("pyserial is missing. Activate the venv: /opt/rpi-player/venv/bin/python")
+
+
+BUTTON_PROMPTS = [
+    ("side", "the SIDE button (the large one on the left face)"),
+    ("top", "the TOP button"),
+    ("tall", "the TALL button"),
+    ("short", "the SHORT button"),
+    ("tour", "the TOUR button"),
+    ("dpad_up", "D-pad UP"),
+    ("dpad_down", "D-pad DOWN"),
+    ("dpad_left", "D-pad LEFT"),
+    ("dpad_right", "D-pad RIGHT"),
+    ("knob_click", "the KNOB pressed in (click)"),
+    ("scroll_click", "the SCROLL WHEEL pressed in (click)"),
+    ("dial_click", "the DIAL pressed in (click)"),
+]
+
+ROTARY_PROMPTS = [
+    ("knob", "the KNOB (the big rotary dial)"),
+    ("scroll", "the SCROLL WHEEL"),
+    ("dial", "the flat DIAL"),
+]
+
+
+def find_port(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    for candidate in ["/dev/tourbox", *sorted(glob.glob("/dev/ttyACM*"))]:
+        if os.path.exists(candidate):
+            return candidate
+    sys.exit(
+        "No TourBox found. Checked /dev/tourbox and /dev/ttyACM*.\n"
+        "Is it plugged in with a DATA cable (not power-only)?\n"
+        "Check: ls -l /dev/ttyACM*   and   dmesg | tail"
+    )
+
+
+def open_port(path: str, baud: int) -> serial.Serial:
+    try:
+        return serial.Serial(path, baud, timeout=0, exclusive=True)
+    except serial.SerialException as exc:
+        if "Busy" in str(exc) or "busy" in str(exc):
+            sys.exit(
+                f"{path} is busy. Two usual causes:\n"
+                f"  1. The daemon is running:  sudo systemctl stop tourbox-player\n"
+                f"  2. ModemManager grabbed it: sudo fuser -v {path}\n"
+                f"     Fix with /etc/udev/rules.d/99-tourbox.rules"
+            )
+        sys.exit(f"Cannot open {path}: {exc}\nAre you in the 'dialout' group? (groups)")
+
+
+def drain(port: serial.Serial, seconds: float = 0.3) -> None:
+    """Discard buffered bytes so a previous press does not pollute the next step."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if select.select([port.fileno()], [], [], 0.05)[0]:
+            port.read(256)
+
+
+def collect(port: serial.Serial, seconds: float = 2.0) -> list[int]:
+    """Collect bytes for a fixed window, returning them in arrival order."""
+    out: list[int] = []
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        if select.select([port.fileno()], [], [], min(0.1, remaining))[0]:
+            out.extend(port.read(256))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Sniff mode
+# ---------------------------------------------------------------------------
+
+
+def sniff(port: serial.Serial) -> None:
+    print("Sniffing. Press controls on the TourBox. Ctrl+C to stop.\n")
+    print(f"{'time':>9}  {'hex':>4}  {'dec':>4}  {'bin':>10}  note")
+    print("-" * 56)
+    start = time.monotonic()
+    seen: dict[int, int] = {}
+    try:
+        while True:
+            if not select.select([port.fileno()], [], [], 0.2)[0]:
+                continue
+            for byte in port.read(256):
+                elapsed = time.monotonic() - start
+                seen[byte] = seen.get(byte, 0) + 1
+                # High bit set is the release of (byte & 0x7F) under the
+                # documented convention.
+                note = ""
+                if byte & 0x80:
+                    note = f"release of 0x{byte & 0x7F:02X}?"
+                print(f"{elapsed:9.3f}  0x{byte:02X}  {byte:4d}  {byte:>10b}  {note}")
+    except KeyboardInterrupt:
+        print("\n\nByte frequency summary:")
+        for byte, count in sorted(seen.items()):
+            kind = "release?" if byte & 0x80 else "press/detent"
+            print(f"  0x{byte:02X}  seen {count:4d}x   {kind}")
+
+
+# ---------------------------------------------------------------------------
+# Learn mode
+# ---------------------------------------------------------------------------
+
+
+def learn_button(port: serial.Serial, name: str, description: str) -> dict | None:
+    print(f"\n  [{name}]  Press and release {description}.")
+    input("  Press ENTER when ready, then press the control once... ")
+    drain(port)
+    print("  Listening for 2 seconds — press it NOW.")
+    data = collect(port, 2.0)
+
+    if not data:
+        print("  ! Nothing received. Skipping (you can add it manually later).")
+        return None
+
+    # First byte without the high bit is the press code.
+    press = next((b for b in data if not (b & 0x80)), None)
+    if press is None:
+        print(f"  ! Only high-bit bytes seen: {[hex(b) for b in data]}. Skipping.")
+        return None
+
+    release = next((b for b in data if b == (press | 0x80)), None)
+    if release is not None:
+        print(f"  ✓ press=0x{press:02X}  release=0x{release:02X}  (matches convention)")
+    else:
+        others = [hex(b) for b in data if b != press]
+        print(f"  ✓ press=0x{press:02X}  (no matching release; also saw {others})")
+
+    return {"byte": press}
+
+
+def learn_rotary(port: serial.Serial, name: str, description: str) -> dict | None:
+    result: dict[str, int] = {}
+
+    for direction, label in (("cw", "CLOCKWISE"), ("ccw", "COUNTER-CLOCKWISE")):
+        print(f"\n  [{name}.{direction}]  Turn {description} {label}.")
+        input("  Press ENTER when ready, then turn it slowly... ")
+        drain(port)
+        print("  Listening for 3 seconds — turn it NOW, a few clicks.")
+        data = collect(port, 3.0)
+
+        if not data:
+            print("  ! Nothing received. Skipping.")
+            return None
+
+        # The most frequent byte is the detent code; strays are noise.
+        counts: dict[int, int] = {}
+        for byte in data:
+            counts[byte] = counts.get(byte, 0) + 1
+        best = max(counts, key=lambda b: counts[b])
+        print(f"  ✓ {direction}=0x{best:02X}  ({counts[best]} detents"
+              f"{', other bytes: ' + str([hex(b) for b in counts if b != best]) if len(counts) > 1 else ''})")
+        result[direction] = best
+
+    if result.get("cw") == result.get("ccw"):
+        print("  ! Both directions produced the same byte. This rotary may encode")
+        print("    direction differently. Re-run --sniff and inspect manually.")
+        return None
+
+    return result
+
+
+def learn(port: serial.Serial, out_path: Path) -> None:
+    print("=" * 68)
+    print("TourBox keymap learning")
+    print("=" * 68)
+    print(
+        "\nYou will be prompted for each control. Take your time; you can\n"
+        "skip anything your model does not have by pressing ENTER and\n"
+        "waiting out the listening window.\n"
+    )
+
+    buttons: dict[str, dict] = {}
+    for name, description in BUTTON_PROMPTS:
+        entry = learn_button(port, name, description)
+        if entry:
+            buttons[name] = entry
+
+    rotaries: dict[str, dict] = {}
+    for name, description in ROTARY_PROMPTS:
+        entry = learn_rotary(port, name, description)
+        if entry:
+            rotaries[name] = entry
+
+    # Collision check — the single most valuable output of this tool.
+    collisions: list[str] = []
+    used: dict[int, str] = {}
+    for name, entry in buttons.items():
+        byte = entry["byte"]
+        if byte in used:
+            collisions.append(f"0x{byte:02X}: {used[byte]} and {name}")
+        used[byte] = name
+    for name, entry in rotaries.items():
+        for direction in ("cw", "ccw"):
+            byte = entry[direction]
+            key = f"{name}.{direction}"
+            if byte in used:
+                collisions.append(f"0x{byte:02X}: {used[byte]} and {key}")
+            used[byte] = key
+
+    write_keymap(out_path, buttons, rotaries)
+
+    print("\n" + "=" * 68)
+    print(f"Wrote {out_path}")
+    print(f"  {len(buttons)} buttons, {len(rotaries)} rotaries")
+    if collisions:
+        print("\n  !! BYTE COLLISIONS DETECTED — these controls share a code:")
+        for line in collisions:
+            print(f"       {line}")
+        print("     Re-run the affected controls, or inspect with --sniff.")
+    else:
+        print("  No byte collisions. Keymap looks sound.")
+    print("=" * 68)
+    print(
+        f"\nNext:\n"
+        f"  diff /opt/rpi-player/etc/keymap.toml {out_path}\n"
+        f"  sudo cp {out_path} /opt/rpi-player/etc/keymap.toml\n"
+        f"  sudo systemctl start tourbox-player\n"
+        f"\nNOTE: this writes byte codes only. Your action assignments from the\n"
+        f"existing keymap.toml are preserved as defaults in the output — review\n"
+        f"the file and adjust press/long/shift to taste.\n"
+    )
+
+
+DEFAULT_ACTIONS = {
+    "side": {"press": "noop"},
+    "top": {"press": "toggle_random", "shift": "toggle_repeat"},
+    "tall": {"press": "toggle_pause", "shift": "stop"},
+    "short": {"press": "toggle_mute", "long": "update_database"},
+    "tour": {"press": "cycle_output", "shift": "cycle_output_back"},
+    "dpad_up": {"press": "library_up", "shift": "next_album"},
+    "dpad_down": {"press": "library_down", "shift": "prev_album"},
+    "dpad_left": {"press": "library_back", "shift": "prev_track"},
+    "dpad_right": {"press": "library_select", "shift": "next_track"},
+    "knob_click": {"press": "toggle_mute"},
+    "scroll_click": {"press": "seek_to_start"},
+    "dial_click": {"press": "toggle_pause"},
+}
+
+DEFAULT_ROTARY_ACTIONS = {
+    "knob": {"action_cw": "volume_up", "action_ccw": "volume_down",
+             "shift_cw": "cycle_output", "shift_ccw": "cycle_output_back"},
+    "scroll": {"action_cw": "seek_forward", "action_ccw": "seek_back",
+               "shift_cw": "next_album", "shift_ccw": "prev_album"},
+    "dial": {"action_cw": "next_track", "action_ccw": "prev_track",
+             "shift_cw": "library_down", "shift_ccw": "library_up"},
+}
+
+
+def write_keymap(path: Path, buttons: dict, rotaries: dict) -> None:
+    lines: list[str] = [
+        "# /opt/rpi-player/etc/keymap.toml",
+        "#",
+        f"# GENERATED by tourbox-capture --learn on {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "# Byte codes below were recorded from THIS device and are trustworthy.",
+        "# Action assignments are defaults — edit them to taste.",
+        "",
+        'modifier = "side"',
+        "",
+    ]
+
+    for name, entry in buttons.items():
+        defaults = DEFAULT_ACTIONS.get(name, {"press": "noop"})
+        lines.append(f"[buttons.{name}]")
+        lines.append(f"byte = 0x{entry['byte']:02X}")
+        for key in ("press", "long", "shift"):
+            if key in defaults:
+                lines.append(f'{key} = "{defaults[key]}"')
+        lines.append("")
+
+    for name, entry in rotaries.items():
+        defaults = DEFAULT_ROTARY_ACTIONS.get(name, {})
+        lines.append(f"[rotary.{name}]")
+        lines.append(f"cw  = 0x{entry['cw']:02X}")
+        lines.append(f"ccw = 0x{entry['ccw']:02X}")
+        for key in ("action_cw", "action_ccw", "shift_cw", "shift_ccw"):
+            if key in defaults:
+                lines.append(f'{key} = "{defaults[key]}"')
+        lines.append("")
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Capture and learn TourBox byte codes",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--sniff", action="store_true", help="dump raw bytes live")
+    mode.add_argument("--learn", action="store_true", help="guided keymap generation")
+    parser.add_argument("--port", default=None, help="serial device (auto-detected)")
+    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--out", type=Path, default=Path("/tmp/keymap.toml"))
+    args = parser.parse_args()
+
+    path = find_port(args.port)
+    print(f"Using {path} @ {args.baud} baud\n")
+    port = open_port(path, args.baud)
+
+    try:
+        if args.sniff:
+            sniff(port)
+        else:
+            learn(port, args.out)
+    finally:
+        port.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

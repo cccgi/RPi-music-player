@@ -1,0 +1,90 @@
+[Unit]
+Description=mpv video engine for karaoke/.skp playback (idle, DRM output)
+Documentation=file:/opt/rpi-player/docs/VIDEO-MODE.md
+# user@1000.service is what actually starts the per-user PipeWire session
+# mpv needs (see the Environment= comment below) — without waiting for it,
+# mpv can start before that socket exists on a cold boot.
+After=graphical.target user@1000.service
+Wants=user@1000.service
+
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+SupplementaryGroups=video render audio
+
+# Same reason mpd.service needs this (see its own comment): PipeWire is a
+# per-user service with its socket at /run/user/<uid>/pipewire-0, owned by
+# and only visible to that user's session. Without XDG_RUNTIME_DIR set here,
+# mpv has no way to find it — found live: mpv silently fell through its AO
+# autoprobe order (pipewire -> pulse -> alsa -> jack -> sdl) all the way
+# down to `sndio`, which "succeeds" while producing no audible output on any
+# real device. BT/AirPlay routes looked selected on the panel and even
+# showed the right PipeWire default sink, but mpv itself was never actually
+# on the PipeWire graph at all — only the Local route worked, because that
+# one path bypasses PipeWire entirely via a direct ALSA hw: handle.
+# Set the UID correctly if your user is not 1000: `id -u rpi`.
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PIPEWIRE_RUNTIME_DIR=/run/user/1000
+
+# --idle=yes: stays up with nothing loaded, holding the DRM output (black
+# screen, not "off") so entering video mode has near-zero latency instead of
+# a multi-second process spawn — same idea as mpd staying resident.
+#
+# --vo=drm,null --gpu-context=drm: renders straight to HDMI with no desktop
+# session running. Verified directly on this hardware: found the vc4 driver,
+# the connected 1920x1080@60Hz display, and did a real atomic modeset over
+# plain SSH with nothing else running on /dev/dri.
+#
+# The ",null" fallback is not optional. Reported live from the car: with
+# plain --vo=drm and no HDMI monitor connected (or a connector mpv can't
+# find a mode for), mpv's DRM vo fails to initialize, and mpv aborts loading
+# the file ENTIRELY — "no audio or video data played" — so audio never
+# starts either, not just video. This is 100% reproducible: confirmed with
+# --drm-connector set to a nonexistent name, plain --vo=drm errors out with
+# zero playback, while --vo=drm,null falls through to a no-op video output
+# and plays normally, audio included. This is the only way this box can be
+# used as an audio player in the car with no monitor attached at all — most
+# of the time, per the intended use case.
+#
+# --keep-open=yes: don't exit back to a blank/undefined state the instant a
+# file ends — video_daemon decides what plays next, not mpv itself.
+#
+# osc-visibility=never: no on-screen mouse-driven UI overlay; this is
+# controlled entirely over the IPC socket, never with a pointer.
+ExecStart=/usr/bin/mpv --idle=yes --input-ipc-server=/run/rpi-player-video/mpv.sock \
+    --vo=drm,null --gpu-context=drm --hwdec=auto --keep-open=yes \
+    --script-opts=osc-visibility=never --really-quiet
+
+Restart=always
+RestartSec=3
+
+# Deliberately its OWN runtime directory, not the shared /run/rpi-player used
+# by tourbox-player/streamdeck-player.
+#
+# Found the hard way: all three services originally declared
+# RuntimeDirectory=rpi-player. Restarting tourbox-player or streamdeck-player
+# alone (mpv untouched, still running) made mpv.sock vanish from under it —
+# systemd's reference-counted teardown of a directory shared across multiple
+# units does not reliably survive one of the other units restarting. mpv
+# itself only binds its socket once at its own startup, so once the
+# directory was recreated out from under it, the socket was simply gone
+# until mpv itself was restarted too. A unit-private directory has no such
+# multi-owner lifecycle to get wrong.
+RuntimeDirectory=rpi-player-video
+RuntimeDirectoryMode=0770
+
+# --- Hardening --------------------------------------------------------------
+# Deliberately lighter than the other units: mpv needs real access to
+# /dev/dri (video) and the audio devices, and ProtectSystem=strict has
+# already cost real debugging time once on this project (PipeWire socket
+# access) — not worth re-litigating that here for a service whose whole job
+# is touching hardware devices directly.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,115 @@
+#
+# /etc/mpd.conf  —  RPi portable player  (BRING-UP CONFIG, no DAC attached yet)
+#
+# This is the same two-layer output model as system/mpd.conf, adapted to the
+# hardware actually present right now: two HDMI outputs and nothing else.
+#
+# When your USB DAC arrives:
+#   1. aplay -l                       # find its CARD= name
+#   2. uncomment the "Local" block below and set its device
+#   3. sudo systemctl restart mpd
+#   4. install system/pipewire/51-mpd-dac-ignore.conf so WirePlumber does not
+#      claim the card out from under MPD
+#
+# Until then the router marks the "local" route unavailable and skips it,
+# which is the designed behaviour — see player/outputs.py:is_available().
+#
+
+music_directory     "/home/rpi/Music"
+playlist_directory  "/var/lib/mpd/playlists"
+db_file             "/var/lib/mpd/tag_cache"
+state_file          "/var/lib/mpd/state"
+sticker_file        "/var/lib/mpd/sticker.sql"
+
+user                "mpd"
+group               "audio"
+
+# TCP for mpc and debugging, plus a Unix socket for our daemons (lower latency,
+# no TCP handshake). config.toml points at the socket path.
+bind_to_address     "127.0.0.1"
+port                "6600"
+bind_to_address     "/run/mpd/socket"
+
+log_file            "syslog"
+log_level           "notice"
+
+# Resume where we left off. This is what makes it feel like an appliance.
+restore_paused      "yes"
+auto_update         "yes"
+auto_update_depth   "6"
+
+zeroconf_enabled    "yes"
+zeroconf_name       "RPi-Audio"
+
+replaygain           "off"
+volume_normalization "no"
+
+input {
+    plugin "curl"
+}
+
+#
+# ---------------------------------------------------------------------------
+# OUTPUT — HDMI  (the only real output until a DAC is attached)
+# ---------------------------------------------------------------------------
+# vc4hdmi0 is the HDMI port nearest the USB-C power connector on a Pi 5.
+# If you get silence, try vc4hdmi1 — you are probably plugged into the other one.
+#
+# NOTE THE "plughw:" PREFIX — this is not optional for HDMI.
+#
+# The Pi's vc4hdmi ALSA device accepts exactly ONE format:
+#
+#     aplay -D hw:CARD=vc4hdmi0,DEV=0 ...
+#     Available formats:
+#     - IEC958_SUBFRAME_LE
+#
+# That is the raw S/PDIF-over-HDMI subframe encoding, not plain PCM. Handing it
+# S16_LE — which is what MPD does over a bare hw: device — fails with:
+#
+#     Failed to open "HDMI" (alsa); Failed to configure format 24: Invalid argument
+#
+# and MPD drops straight back to pause, so the symptom is "everything is
+# indexed, nothing plays, no obvious error unless you look at `mpc status`".
+#
+# "plughw:" inserts ALSA's plug layer, which converts PCM into IEC958 subframes.
+# Losing bit-perfect here costs nothing: HDMI is a convenience output, and the
+# wired DAC below is the quality path.
+audio_output {
+    type            "alsa"
+    name            "HDMI"
+    device          "plughw:CARD=vc4hdmi0,DEV=0"
+    mixer_type      "software"
+    enabled         "yes"
+}
+
+#
+# ---------------------------------------------------------------------------
+# OUTPUT — PipeWire  (carries Bluetooth A2DP and AirPlay/RAOP)
+# ---------------------------------------------------------------------------
+# No target= on purpose: it follows PipeWire's *default* sink, which the router
+# changes with `wpctl set-default`. One MPD output, many wireless destinations.
+#
+audio_output {
+    type            "pipewire"
+    name            "Network"
+    mixer_type      "software"
+    enabled         "no"
+}
+
+#
+# ---------------------------------------------------------------------------
+# OUTPUT — Local wired DAC  (UNCOMMENT WHEN THE DAC ARRIVES)
+# ---------------------------------------------------------------------------
+# Use the hw:CARD=<name> form, not hw:1,0 — card numbers shuffle when USB
+# devices enumerate in a different order, names do not.
+#
+# audio_output {
+#     type            "alsa"
+#     name            "Local"
+#     device          "hw:CARD=XXXX,DEV=0"
+#     mixer_type      "software"
+#     auto_resample   "no"
+#     auto_format     "no"
+#     auto_channels   "no"
+#     enabled         "no"
+# }

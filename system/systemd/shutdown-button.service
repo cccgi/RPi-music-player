@@ -1,0 +1,30 @@
+[Unit]
+Description=GPIO clean-shutdown button
+Documentation=file:/opt/rpi-player/docs/ROADMAP.md
+After=multi-user.target
+
+# MUST be in [Unit], not [Service] — systemd ignores them in [Service].
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+# Needs root to call systemctl poweroff without a polkit dance, and gpio group
+# for the pin. Kept minimal: this process does almost nothing.
+User=root
+Group=gpio
+
+ExecStart=/opt/rpi-player/venv/bin/python /opt/rpi-player/bin/shutdown-button
+Environment=PYTHONUNBUFFERED=1
+Environment=RPI_PLAYER_HOME=/opt/rpi-player
+
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

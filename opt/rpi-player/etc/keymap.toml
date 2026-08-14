@@ -1,0 +1,266 @@
+# /opt/rpi-player/etc/keymap.toml
+#
+# ############################################################################
+# #  HEADLESS LAYERED LAYOUT                                                  #
+# #  Every byte VERIFIED on this hardware: TourBox NEO, USB ID cafe:4001      #
+# ############################################################################
+#
+# The player is fully operable from the TourBox alone, Stream Deck unplugged.
+#
+# ---------------------------------------------------------------------------
+# LAYERS
+# ---------------------------------------------------------------------------
+# The TOP button cycles layers. It dispatches nothing else — pressing it only
+# switches the meaning of the other buttons.
+#
+#                        LAYER 1: "Track"        LAYER 2: "Folder"
+#   C1                   previous track          previous FOLDER
+#   C2                   next track              next FOLDER
+#   D-pad Left           scrub back  -15s        scrub back  -30s
+#   D-pad Right          scrub fwd   +15s        scrub fwd   +30s
+#   D-pad Up             volume up               volume up
+#   D-pad Down           volume down             volume down
+#   Tall                 play / pause            play / pause
+#   Short                next track              next track
+#   Tour                 DOUBLE-CLICK = delete   DOUBLE-CLICK = delete
+#   Knob click           toggle crossfade 10/5s  toggle crossfade 10/5s
+#     (SHIFT+Knob click still cycles output, its old plain-click job)
+#   Dial click           restart track           restart track
+#   Scroll click         toggle shuffle          toggle shuffle
+#   Side                 SHIFT modifier          SHIFT modifier
+#
+# A layer only declares what it CHANGES; everything else falls back to layer 1.
+#
+# ---------------------------------------------------------------------------
+# WHY THE ROTARIES ARE NOT USED
+# ---------------------------------------------------------------------------
+# Three independent capture sessions recorded ZERO bytes from the Knob, Scroll
+# wheel and Dial rotation on this unit. The clearest was run 3: pressing the
+# scroll wheel IN emits 0x0A, while a full rotation of all three produced 55
+# seconds of complete silence in the same session. Their CLICKS work; their
+# ROTATION does not. Three encoders failing identically is firmware, not three
+# broken parts.
+#
+# ---------------------------------------------------------------------------
+# PROTOCOL
+# ---------------------------------------------------------------------------
+#   button press    -> byte B
+#   button release  -> byte B | 0x80        (confirmed: 0x00 -> 0x80)
+#
+# Re-verify at any time:
+#   sudo systemctl stop tourbox-player
+#   /opt/rpi-player/venv/bin/python /opt/rpi-player/bin/tourbox-capture --sniff
+
+modifier = "side"
+layer_toggle = "top"
+layer_order = ["track", "folder", "video"]
+# Layer 3 ("video") is NOT part of Top's normal track<->folder cycle — it is
+# only entered/left via the Stream Deck's mode-switch key. See
+# Decoder.cycle_layer() and docs/VIDEO-MODE.md section 6.
+
+# How close two presses must be to count as a double-click.
+# NOTE: a control with BOTH a `press` and a `double` binding pays this as
+# latency on its single press. Tour has ONLY a `double` binding, so it costs
+# nothing anywhere — a single press simply does nothing.
+double_click_seconds = 0.35
+
+
+# ===========================================================================
+# BUTTONS — byte codes only. Actions live in the layers below.
+# ===========================================================================
+# Separating these means adding a layer can never corrupt a verified byte map.
+
+[buttons.tall]
+byte = 0x00        # VERIFIED (captured in three separate sessions)
+
+[buttons.side]
+byte = 0x01        # VERIFIED
+
+[buttons.top]
+byte = 0x02        # VERIFIED — layer toggle
+
+[buttons.short]
+byte = 0x03        # VERIFIED
+
+[buttons.scroll_click]
+byte = 0x0A        # VERIFIED
+
+[buttons.dpad_up]
+byte = 0x10        # VERIFIED
+
+[buttons.dpad_down]
+byte = 0x11        # VERIFIED
+
+[buttons.dpad_left]
+byte = 0x12        # VERIFIED
+
+[buttons.dpad_right]
+byte = 0x13        # VERIFIED
+
+[buttons.c1]
+byte = 0x22        # VERIFIED 2026-08-10 (release 0xA2)
+
+[buttons.c2]
+byte = 0x23        # VERIFIED 2026-08-10 (release 0xA3)
+
+[buttons.tour]
+byte = 0x2A        # VERIFIED
+
+[buttons.knob_click]
+byte = 0x37        # VERIFIED
+
+[buttons.dial_click]
+byte = 0x38        # VERIFIED
+
+
+# ===========================================================================
+# LAYER 1 — "Track"  (default)
+# ===========================================================================
+
+[layers.track]
+label = "Track"
+
+[layers.track.press]
+tall         = "toggle_pause"
+short        = "next_track"
+c1           = "prev_track"
+c2           = "next_track"
+dpad_up      = "volume_up"
+dpad_down    = "volume_down"
+dpad_left    = "seek_back"        # -15s  (config.toml [tourbox.steps] seek)
+dpad_right   = "seek_forward"     # +15s
+knob_click   = "toggle_crossfade"   # was cycle_output — see shift below
+dial_click   = "seek_to_start"
+scroll_click = "toggle_random"
+
+[layers.track.shift]
+tall         = "stop"
+short        = "toggle_mute"
+c1           = "prev_album"
+c2           = "next_album"
+dpad_left    = "seek_back_fast"    # -60s
+dpad_right   = "seek_forward_fast" # +60s
+knob_click   = "cycle_output_back"  # only route-cycle control left on the TourBox now
+scroll_click = "toggle_repeat"
+
+[layers.track.double]
+# Tour has NO single-press binding, so a lone press does nothing and the
+# double fires immediately with no added latency anywhere on the device.
+# delete_current already advances to the next track before removing the file.
+tour = "delete_current"
+
+
+# ===========================================================================
+# LAYER 2 — "Folder"
+# ===========================================================================
+# Only the controls that CHANGE are listed. Everything else — Tall, Short,
+# Up/Down volume, Tour double-click, the clicks — falls back to layer 1.
+
+[layers.folder]
+label = "Folder"
+
+[layers.folder.press]
+c1         = "prev_folder"
+c2         = "next_folder"
+dpad_left  = "seek_back_fast"      # -30s in this layer, see config.toml
+dpad_right = "seek_forward_fast"   # +30s
+
+[layers.folder.shift]
+c1         = "prev_album"
+c2         = "next_album"
+
+
+# ===========================================================================
+# LAYER 3 — "Video" (karaoke / .skp mode)
+# ===========================================================================
+# Entered only from the Stream Deck's Video key (never by cycling Top — see
+# layer_order above). Side stops being the shift modifier here and becomes a
+# direct action: tap it to switch between the vocal and karaoke audio track,
+# per Decoder's tap-vs-hold logic (a lone tap fires `press`; held-and-used-
+# to-shift-something-else still behaves as a modifier everywhere else, this
+# layer included, in case that's ever wanted here too).
+#
+# Tour's double-click is video_delete_current here, NOT delete_current —
+# falling through to the music layer's binding would delete the wrong thing
+# entirely: whatever MPD happened to have last played, not the karaoke video
+# actually on screen. See [layers.track.double]'s comment for why this is a
+# double-click with no single-press binding at all.
+
+[layers.video]
+label = "Video"
+
+[layers.video.press]
+side         = "switch_track"
+tall         = "video_play_pause"
+short        = "video_next_song"
+c1           = "video_prev_song"
+c2           = "video_next_song"
+dpad_left    = "video_seek_back"
+dpad_right   = "video_seek_forward"
+dpad_up      = "video_volume_up"
+dpad_down    = "video_volume_down"
+# Neutralised rather than left to fall back to the music layer — none of
+# these are destructive, but silently nudging MPD's output route/shuffle/
+# seek-position while the panel shows karaoke controls is confusing, not
+# useful. Free to bind these to something video-specific later.
+#
+# IMPORTANT: any control left unbound here falls back to the base (Track)
+# layer's binding — see Keymap.resolve() in player/config.py. That is by
+# design for controls that are genuinely shared, but it silently bit us
+# once already: `short` had no video-layer binding, so it fell back to
+# Track's `next_track`, which fires an MPD command against the *music*
+# player while mpv is the one actually on screen — MPD would then start
+# playing whatever was last in its queue, audibly on top of the video's
+# own audio. Every control that has a real video-mode meaning must be
+# listed explicitly above; only genuinely mode-agnostic controls (or ones
+# deliberately noop'd below) should be left to fall through.
+knob_click   = "noop"
+dial_click   = "noop"
+scroll_click = "noop"
+
+# Shift chords: same fall-through hazard as above, and this layer had NO
+# [layers.video.shift] table at all before, so every shifted control here
+# fell all the way through to Track's shift bindings (stop, toggle_mute,
+# prev_album/next_album, fast-seek, cycle_output_back, toggle_repeat) —
+# all MPD-targeting, all capable of the same "two players fighting" bug as
+# `short` above. Noop'd wholesale rather than picked off one at a time.
+[layers.video.shift]
+tall         = "noop"
+short        = "noop"
+c1           = "noop"
+c2           = "noop"
+dpad_left    = "noop"
+dpad_right   = "noop"
+dpad_up      = "noop"
+dpad_down    = "noop"
+knob_click   = "noop"
+scroll_click = "noop"
+
+[layers.video.double]
+tour = "video_delete_current"
+
+
+# ===========================================================================
+# ROTARY — RETAINED BUT INERT. This unit emits no rotary bytes at all.
+# ===========================================================================
+# Values from bloodywing/tourboxneo, never observed on this hardware. Harmless
+# if wrong: the daemon logs any unmapped byte once, so if the real codes differ
+# you will see them in `journalctl -u tourbox-player`.
+
+[rotary.knob]
+cw  = 0x44         # UNVERIFIED
+ccw = 0x04         # UNVERIFIED
+action_cw  = "volume_up"
+action_ccw = "volume_down"
+
+[rotary.scroll]
+cw  = 0x49         # UNVERIFIED
+ccw = 0x09         # UNVERIFIED
+action_cw  = "seek_forward"
+action_ccw = "seek_back"
+
+[rotary.dial]
+cw  = 0x0F         # UNVERIFIED
+ccw = 0x4F         # UNVERIFIED
+action_cw  = "next_track"
+action_ccw = "prev_track"

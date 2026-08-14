@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""GPIO shutdown button watcher.
+
+Why this exists: this is a PORTABLE device that will be powered off by
+disconnecting a battery. Abrupt power loss during a filesystem write is the
+single most likely way the build dies in the field — you come back to an
+unbootable card. A physical button that triggers a clean shutdown is cheap
+insurance and should be fitted in Phase 5, not left as a nice-to-have.
+
+Wiring (BCM numbering, default pin 3):
+
+    Button leg 1  ->  GPIO 3  (physical pin 5)
+    Button leg 2  ->  GND     (physical pin 6)
+
+Pin 3 is chosen deliberately: on the Raspberry Pi it doubles as the firmware's
+WAKE pin, so the SAME button will also power the board back on from a halted
+state. Any other GPIO gives you shutdown but not wake.
+
+Uses gpiozero, which is preinstalled on Raspberry Pi OS and speaks to the Pi 5's
+RP1 GPIO controller correctly (the older RPi.GPIO library does NOT work on Pi 5).
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, "/opt/rpi-player")
+
+from player.config import load_config, setup_logging  # noqa: E402
+
+LOG = logging.getLogger("shutdown-button")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="GPIO clean-shutdown button")
+    parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--pin", type=int, default=None, help="override BCM pin")
+    parser.add_argument("--hold", type=float, default=None, help="override hold seconds")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="log instead of actually powering off")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    setup_logging(config.log_level)
+
+    if not config.power.enabled and args.pin is None:
+        LOG.info("power.enabled is false in config.toml; nothing to do")
+        return 0
+
+    pin = args.pin if args.pin is not None else config.power.gpio_pin
+    hold = args.hold if args.hold is not None else config.power.hold_seconds
+
+    try:
+        from gpiozero import Button
+    except ImportError:
+        LOG.error(
+            "gpiozero is not available. Install with:\n"
+            "  sudo apt install -y python3-gpiozero python3-lgpio\n"
+            "Note: RPi.GPIO does NOT work on the Pi 5 — gpiozero with the\n"
+            "lgpio backend is the correct choice."
+        )
+        return 1
+
+    LOG.info("watching GPIO %d (BCM); hold %.1fs to shut down", pin, hold)
+
+    # hold_time gives us press-and-hold semantics so a brush against the button
+    # in a bag does not power the device down mid-album.
+    button = Button(pin, pull_up=True, hold_time=hold)
+
+    def on_hold() -> None:
+        LOG.warning("shutdown button held — powering off")
+        # Stop playback first so the DAC is released cleanly and any network
+        # sink gets a proper teardown rather than a dropped stream.
+        subprocess.run(["/usr/bin/mpc", "stop"], check=False,
+                       capture_output=True, timeout=5)
+        if args.dry_run:
+            LOG.warning("--dry-run: would have run 'systemctl poweroff'")
+            return
+        subprocess.run(["/usr/bin/systemctl", "poweroff"], check=False, timeout=10)
+
+    button.when_held = on_hold
+
+    running = True
+
+    def stop(*_: object) -> None:
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    while running:
+        time.sleep(0.5)
+
+    LOG.info("exiting")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

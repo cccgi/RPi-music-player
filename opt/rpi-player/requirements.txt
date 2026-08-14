@@ -1,0 +1,27 @@
+# /opt/rpi-player/requirements.txt
+#
+# Install into the venv:
+#   /opt/rpi-player/venv/bin/pip install -r /opt/rpi-player/requirements.txt
+#
+# System packages these depend on (installed by install.sh):
+#   libhidapi-libusb0   - USB HID backend for the Stream Deck
+#   libjpeg-dev zlib1g-dev - Pillow imaging
+#   fonts-dejavu-core   - the fonts render.py expects
+
+# --- TourBox: CDC-ACM serial ------------------------------------------------
+pyserial==3.5
+
+# --- MPD client -------------------------------------------------------------
+# python-mpd2 is the maintained fork; the original python-mpd is abandoned.
+# Provides send_idle/fetch_idle, which the Stream Deck renderer depends on.
+python-mpd2==3.1.1
+
+# --- Stream Deck ------------------------------------------------------------
+# PyPI package name is 'streamdeck'; import name is 'StreamDeck'.
+streamdeck==0.9.6
+
+# --- Imaging ----------------------------------------------------------------
+Pillow==10.4.0
+
+# NOTE: TOML parsing uses the stdlib `tomllib` (Python 3.11+). Debian Trixie
+# ships Python 3.13, so no external TOML dependency is needed.

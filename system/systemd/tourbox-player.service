@@ -1,0 +1,122 @@
+[Unit]
+Description=TourBox controller -> MPD bridge
+Documentation=file:/opt/rpi-player/docs/ROADMAP.md
+
+# Ordering, not a hard requirement. If MPD is slow to start, the daemon's own
+# reconnect loop copes — we should never fail to start just because MPD is
+# still scanning its database.
+After=mpd.service
+Wants=mpd.service
+
+# BindsTo would stop the service when the TourBox is unplugged, which sounds
+# tidy but is wrong here: we want the daemon to stay up and reconnect on
+# replug, which it handles internally. Deliberately NOT using BindsTo.
+
+# Never give up restarting. This is an appliance with no keyboard; a service
+# that hit its start limit and stopped is indistinguishable from broken
+# hardware.
+#
+# These MUST live in [Unit], not [Service]. systemd silently ignores them in
+# [Service] with "Unknown key ... ignoring" in the journal, and the rate limit
+# then quietly stays at the default of 5 starts per 10s.
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+# The daemon sends READY=1 once it is in its main loop. If it cannot reach
+# systemd it degrades silently, so this is safe.
+TimeoutStartSec=30
+
+User=pi
+Group=pi
+# dialout: read /dev/tourbox (CDC-ACM)
+# audio:   talk to ALSA/PipeWire if we ever need to directly
+SupplementaryGroups=dialout audio
+
+WorkingDirectory=/opt/rpi-player
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=RPI_PLAYER_HOME=/opt/rpi-player
+
+# REQUIRED so the output router can talk to PipeWire — the "cycle output"
+# action needs to enumerate sinks and set the default. A system unit gets no
+# XDG_RUNTIME_DIR, so without this wpctl/pw-dump fail with "Could not connect
+# to PipeWire" and every wireless route reports itself unavailable.
+# Requires: loginctl enable-linger rpi
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PIPEWIRE_RUNTIME_DIR=/run/user/1000
+
+ExecStart=/opt/rpi-player/venv/bin/python -m player.tourbox_daemon
+
+# --- Resilience -------------------------------------------------------------
+Restart=always
+RestartSec=3
+
+# --- Latency ----------------------------------------------------------------
+# The control path must feel instant. This is a tiny, mostly-blocked-on-select
+# process, so a modest priority bump costs nothing and keeps knob response
+# crisp while the Stream Deck is busy compositing images.
+Nice=-5
+CPUSchedulingPolicy=other
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+
+# Real-time scheduling is available if you find latency insufficient, but it
+# is genuinely not needed for serial input at 115200 baud and carries a risk
+# of starving the audio thread. Left commented on purpose:
+# CPUSchedulingPolicy=rr
+# CPUSchedulingPriority=10
+
+# --- Runtime directory ------------------------------------------------------
+# Creates /run/rpi-player owned by this service, for the IPC socket.
+RuntimeDirectory=rpi-player
+RuntimeDirectoryMode=0770
+
+# --- Hardening --------------------------------------------------------------
+# Moderate: enough to limit blast radius, not so much that device access or
+# `systemctl poweroff` breaks.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# /run/user/<uid> MUST be writable: connecting to a Unix domain socket
+# requires write permission on it, and ProtectSystem=strict mounts /run
+# read-only. Without this the daemon has the right user, the right
+# XDG_RUNTIME_DIR and a socket that exists — and still fails with
+# "Could not connect to PipeWire", which looks like a PipeWire fault rather
+# than a sandbox restriction we imposed on ourselves.
+# The '-' prefix makes a path OPTIONAL. /run/rpi-player is created by
+# whichever of these two services starts first (via RuntimeDirectory); without
+# the '-', the other one dies during sandbox setup with
+#   "Failed to set up mount namespacing: /run/rpi-player: No such file or directory"
+# which is a startup-order race, not a real misconfiguration.
+#
+# /home/rpi/Music, /home/rpi/Music-trash and the deletion log ALSO need to be
+# here — delete_current (Tour double-click, see keymap.toml) runs in THIS
+# process too. ProtectHome=read-only mounts ALL of /home read-only in this
+# service's own private mount namespace regardless of the real filesystem's
+# actual (rw) state, so every trash/permanent delete failed with
+# "[Errno 30] Read-only file system", 100% reproducibly, no matter how many
+# times the key was pressed or the service restarted — a plain SSH shell
+# isn't sandboxed the same way, so writes to the very same paths worked fine
+# there, which is what made this look like a flaky SD card rather than a
+# self-inflicted sandbox restriction. /home/rpi/Video too — Tour's double-
+# click now fires video_delete_current in the video layer (see keymap.toml)
+# and needs the same write access there that music's delete has under
+# /home/rpi/Music. Keep in sync with config.toml's [delete] trash_dir/
+# log_path/music_dir and [video] library_dir if you ever change them.
+ReadWritePaths=-/run/rpi-player -/run/user/1000 /home/rpi/Music /home/rpi/Music-trash /home/rpi/deleted-tracks.log /home/rpi/Video
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# Needed for the shutdown action to reach systemd over D-Bus/polkit.
+# If you disable the shutdown action, you can tighten this further.
+DeviceAllow=char-ttyACM rw
+
+[Install]
+WantedBy=multi-user.target

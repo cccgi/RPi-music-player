@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Render the full Stream Deck XL panel to a PNG — no hardware required.
+
+Composites all 32 keycaps exactly as streamdeck_daemon would push them, using
+live MPD state, and writes a single image with the 8x4 grid laid out.
+
+This exists because the display half of the build is fully testable without a
+Stream Deck attached: layout, fonts, truncation, badges, route availability and
+theme colours are all pure rendering. Only the USB transport needs hardware.
+
+Usage:
+    /opt/rpi-player/venv/bin/python /opt/rpi-player/bin/streamdeck-preview
+    ... --out /tmp/panel.png --scale 2
+    ... --demo            # inject fake now-playing state if the queue is empty
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "/opt/rpi-player")
+
+from PIL import Image, ImageDraw, ImageFont  # noqa: E402
+
+from player.config import load_config, setup_logging  # noqa: E402
+from player.mpdbus import MpdCommander  # noqa: E402
+from player.outputs import OutputRouter  # noqa: E402
+from player.streamdeck import layout  # noqa: E402
+from player.streamdeck.browser import LibraryBrowser  # noqa: E402
+from player.streamdeck.render import KeyRenderer, Theme  # noqa: E402
+
+KEY = 96
+GAP = 8
+LABEL_H = 14
+
+
+def collect_state(cfg, mpd, router, demo: bool) -> dict:
+    status = mpd.status()
+    song = mpd.current_song()
+
+    if demo and not song:
+        song = {"title": "Shine On You Crazy Diamond (Parts I-V)",
+                "artist": "Pink Floyd", "album": "Wish You Were Here"}
+        status = {**status, "state": "play", "elapsed": "197.0",
+                  "duration": "811.0", "volume": status.get("volume", "60"),
+                  "song": "6", "playlistlength": "142",
+                  "bitrate": "1411", "audio": "96000:24:2"}
+
+    def f(key, default=0.0):
+        try:
+            return float(status.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    vol_raw = status.get("volume")
+    volume = None
+    if vol_raw is not None and vol_raw != "-1":
+        try:
+            volume = int(vol_raw)
+        except ValueError:
+            volume = None
+
+    current = router.current()
+    return {
+        "state": status.get("state", "stop"),
+        "current_file": song.get("file", ""),
+        "title": song.get("title") or Path(song.get("file", "")).stem or "",
+        "artist": song.get("artist", ""),
+        "album": song.get("album", ""),
+        "elapsed": f("elapsed"),
+        "duration": f("duration"),
+        "volume": volume,
+        "random": status.get("random") == "1",
+        "repeat": status.get("repeat") == "1",
+        "single": status.get("single") == "1",
+        "consume": status.get("consume") == "1",
+        "song_index": status.get("song"),
+        "playlist_length": status.get("playlistlength", "0"),
+        "bitrate": status.get("bitrate", ""),
+        "audio": status.get("audio", ""),
+        "route_id": current.id if current else "",
+        "route_label": current.label if current else "None",
+        "available_routes": {r.id for r in router.available_routes()},
+    }
+
+
+def render_key(renderer: KeyRenderer, key: int, defn, state, cfg, route_keys):
+    """Mirror streamdeck_daemon._render_key, minus the caching and USB push."""
+    if key in route_keys:
+        route = cfg.route_by_id(route_keys[key])
+        if route is None:
+            return renderer.blank()
+        return renderer.route(route.label,
+                              state["route_id"] == route.id,
+                              route.id in state["available_routes"])
+
+    if defn is None:
+        return renderer.blank()
+
+    kind, p = defn.kind, defn.params
+
+    if kind == "blank":
+        return renderer.blank()
+    if kind == "playpause":
+        playing = state["state"] == "play"
+        return renderer.glyph("pause" if playing else "play",
+                              colour=renderer.theme.active if playing else renderer.theme.fg)
+    if kind == "glyph":
+        caption = p.get("caption", "")
+        if "caption_fmt" in p:
+            steps = cfg.tourbox.steps
+            caption = p["caption_fmt"].format(seek=steps.seek, volume=steps.volume)
+        return renderer.glyph(p.get("symbol", "speaker"), caption=caption)
+    if kind == "label":
+        return renderer.label(defn.label, sub=p.get("sub", ""))
+    if kind == "browse_entry":
+        browser = state["_browser"]
+        entry = browser.visible()[p.get("slot", 0)] if browser else None
+        if entry is None:
+            return renderer.browse_entry("", is_dir=False, empty=True)
+        return renderer.browse_entry(entry.name, is_dir=entry.is_dir,
+                                     is_playing=entry.uri == state["current_file"])
+    if kind == "browse_back":
+        b = state["_browser"]
+        return renderer.browse_nav("Back", sub=(b.breadcrumb()[:12] if b else ""),
+                                   enabled=bool(b and not b.at_root))
+    if kind == "browse_page":
+        b = state["_browser"]
+        if b is None:
+            return renderer.browse_nav("Page", enabled=False)
+        return renderer.browse_nav("Page", sub=f"{b.page_index + 1}/{b.page_count}",
+                                   enabled=b.page_count > 1)
+    if kind == "art":
+        return renderer.blank()
+    if kind == "now_playing_title":
+        return renderer.now_playing(state["title"], state["artist"])
+    if kind == "now_playing_album":
+        return renderer.label(state["album"] or "—", sub="album")
+    if kind == "queue_position":
+        idx = state["song_index"]
+        pos = (int(idx) + 1) if idx is not None else 0
+        return renderer.label(f"{pos}", sub=f"of {state['playlist_length']}")
+    if kind == "progress":
+        return renderer.progress(state["elapsed"], state["duration"], state["state"])
+    if kind == "volume":
+        return renderer.volume(state["volume"], state["volume"] == 0)
+    if kind.startswith("mode_"):
+        mode = kind[len("mode_"):]
+        pretty = {"random": "Shuffle", "repeat": "Repeat",
+                  "single": "Single", "consume": "Consume"}[mode]
+        return renderer.status(pretty, bool(state.get(mode)))
+    if kind == "bitrate":
+        audio = state["audio"]
+        pretty = ""
+        if audio:
+            parts = audio.split(":")
+            if len(parts) >= 2:
+                try:
+                    pretty = f"{int(parts[0]) / 1000:g}k/{parts[1]}"
+                except ValueError:
+                    pretty = audio
+        sub = f"{state['bitrate']}kbps" if state["bitrate"] else ""
+        return renderer.label(pretty or "—", sub=sub)
+    if kind == "delete":
+        mode = cfg.delete.mode
+        colour = {"queue": renderer.theme.muted, "trash": renderer.theme.warn,
+                  "permanent": "#FF453A"}.get(mode, renderer.theme.muted)
+        caption = {"queue": "Dequeue", "trash": "Trash",
+                   "permanent": "DELETE"}.get(mode, "Delete")
+        if not cfg.delete.enabled:
+            colour, caption = "#48484A", "off"
+        return renderer.glyph("trash", caption=caption, colour=colour)
+    if kind == "power":
+        return renderer.glyph("power", caption="Hold", colour=renderer.theme.warn)
+    return renderer.blank()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Render the Stream Deck panel to PNG")
+    ap.add_argument("--out", type=Path, default=Path("/tmp/streamdeck-preview.png"))
+    ap.add_argument("--scale", type=int, default=1)
+    ap.add_argument("--demo", action="store_true",
+                    help="inject sample track data when the queue is empty")
+    ap.add_argument("--labels", action="store_true", default=True)
+    ap.add_argument("--browse", default=None,
+                    help="start the browser in this library subdirectory")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    setup_logging("ERROR")
+
+    t = cfg.streamdeck.theme
+    renderer = KeyRenderer(Theme(bg=t.bg, fg=t.fg, muted=t.muted, accent=t.accent,
+                                 active=t.active, warn=t.warn,
+                                 font_regular=t.font_regular, font_bold=t.font_bold))
+
+    mpd = MpdCommander(cfg.mpd.host, cfg.mpd.port, cfg.mpd.timeout)
+    router = OutputRouter(mpd, cfg.routes)
+    state = collect_state(cfg, mpd, router, args.demo)
+    try:
+        browser = LibraryBrowser(mpd)
+        if args.browse:
+            browser.path = args.browse; browser.refresh()
+    except Exception as exc:
+        print(f"  browser unavailable: {exc}"); browser = None
+    state["_browser"] = browser
+
+    route_keys = {slot: r.id for slot, r in zip(layout.ROUTE_SLOTS, cfg.routes)}
+
+    cols, rows = layout.COLUMNS, layout.ROWS
+    cell_h = KEY + (LABEL_H if args.labels else 0)
+    W = cols * KEY + (cols + 1) * GAP
+    H = rows * cell_h + (rows + 1) * GAP
+    sheet = Image.new("RGB", (W, H), "#000000")
+    draw = ImageDraw.Draw(sheet)
+    try:
+        small = ImageFont.truetype(t.font_regular, 9)
+    except OSError:
+        small = ImageFont.load_default()
+
+    for key in range(cols * rows):
+        r, c = divmod(key, cols)
+        x = GAP + c * (KEY + GAP)
+        y = GAP + r * (cell_h + GAP)
+        img = render_key(renderer, key, layout.key_def(key), state, cfg, route_keys)
+        sheet.paste(img, (x, y))
+        if args.labels:
+            defn = layout.key_def(key)
+            name = route_keys.get(key) or (defn.kind if defn else "-")
+            draw.text((x + KEY // 2, y + KEY + LABEL_H // 2), f"{key}:{name}"[:18],
+                      font=small, fill="#666666", anchor="mm")
+
+    if args.scale > 1:
+        sheet = sheet.resize((W * args.scale, H * args.scale), Image.LANCZOS)
+
+    sheet.save(args.out)
+    mpd.close()
+
+    print(f"wrote {args.out}  ({sheet.width}x{sheet.height})")
+    print(f"  state={state['state']} vol={state['volume']} route={state['route_label']}")
+    print(f"  track={state['title'][:48]!r} / {state['artist'][:32]!r}")
+    print(f"  routes available: {sorted(state['available_routes'])}")
+    if browser:
+        print(f"  browser at {browser.path or '/'!r}: {len(browser.entries)} entries, "
+              f"page {browser.page_index+1}/{browser.page_count}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

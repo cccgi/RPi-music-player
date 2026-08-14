@@ -1,0 +1,16 @@
+// /etc/polkit-1/rules.d/50-rpi-player-wifi.rules
+//
+// Same problem as 49-rpi-player-shutdown.rules, different D-Bus action:
+// `nmcli radio wifi off`/`on` run as the unattended "rpi" service account
+// talks to NetworkManager over D-Bus, which requires polkit authorization
+// for org.freedesktop.NetworkManager.enable-disable-wifi. There is no
+// session/agent to prompt for a password, so without this rule the Video
+// page's Wi-Fi toggle key (streamdeck_daemon.py's "wifi_toggle" kind,
+// actions.py's toggle_wifi) would fail exactly the same silent way
+// poweroff did before the shutdown rule existed.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.NetworkManager.enable-disable-wifi" &&
+        subject.user == "rpi") {
+        return polkit.Result.YES;
+    }
+});

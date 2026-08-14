@@ -1,0 +1,11 @@
+#!/bin/sh
+# Pin the Sound Blaster Play! 3's hardware "Speaker" control to 0dB (max).
+#
+# Run by udev (system/udev/99-soundblaster-gain.rules) every time the card's
+# control device appears — boot, and any USB unplug/replug. See that file for
+# why this control needs pinning at all: MPD's software mixer never touches
+# it, so it silently sits at the DAC's -20dB power-on default otherwise.
+#
+# Card is addressed by NAME ("S3"), not number — index shifts depending on
+# enumeration order if other USB audio is plugged in; the name does not.
+exec /usr/bin/amixer -c S3 sset Speaker 100% >/dev/null 2>&1

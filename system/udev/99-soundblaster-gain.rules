@@ -1,0 +1,22 @@
+# /etc/udev/rules.d/99-soundblaster-gain.rules
+#
+# The Sound Blaster Play! 3 (041e:324d) powers up with its onboard "Speaker"
+# digital attenuator at -20dB (55%), not the 0dB it's capable of — this is the
+# DAC's own default, not anything Linux or MPD sets.
+#
+# mpd.conf's Local output uses mixer_type "software": MPD's volume control
+# scales PCM samples in software and never touches this ALSA hardware
+# control, by design (it's what keeps a route-agnostic volume knob working
+# the same way on Bluetooth/AirPlay too). That means nothing ever moves this
+# control off its power-on default — every reboot and every USB
+# unplug/replug quietly puts a fixed -20dB pad in front of an otherwise
+# correctly-configured bit-perfect chain. Measured: 20dB is roughly a 10x
+# amplitude cut, enough on its own to explain needing far more downstream
+# gain (car head unit volume) than a normal source, which is what raises the
+# noise floor and ground-loop hum along with it.
+#
+# Pin it to 0dB (max) every time the card appears. MPD's software volume
+# still does all the real attenuation on top of this fixed ceiling.
+ACTION=="add", SUBSYSTEM=="sound", KERNEL=="controlC*", \
+    ATTRS{idVendor}=="041e", ATTRS{idProduct}=="324d", \
+    RUN+="/opt/rpi-player/bin/soundblaster-gain"

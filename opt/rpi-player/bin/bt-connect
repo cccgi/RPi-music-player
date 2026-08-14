@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Pair, trust and connect a Bluetooth audio sink, then verify it in PipeWire.
+
+Wraps the bluetoothctl dance that is easy to get subtly wrong:
+
+  * **trust** is what makes the headphones reconnect automatically after a
+    reboot. Pairing alone does not — this is the single most common reason a
+    "working" BT setup stops working the next day.
+  * pairing must happen while the device is in pairing mode, so we scan in a
+    loop rather than taking one snapshot.
+  * a successful `connect` does NOT guarantee an A2DP sink exists; the profile
+    can land on HFP/HSP instead, which sounds like a telephone. We check
+    PipeWire for a `bluez_output` node and report the active codec.
+
+Usage:
+    bt-connect --scan                       # list audio-capable devices
+    bt-connect --match bose                 # pair+connect first name match
+    bt-connect --mac 4C:87:5D:xx:xx:xx      # pair+connect a specific address
+    bt-connect --wait 180 --match bose      # keep scanning for 3 minutes
+    bt-connect --status                     # what is connected right now
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+BTCTL = shutil.which("bluetoothctl") or "/usr/bin/bluetoothctl"
+WPCTL = shutil.which("wpctl") or "/usr/bin/wpctl"
+
+# Audio sinks advertise these major/minor device classes. Used to filter the
+# noise — a typical scan turns up dozens of BLE lightbulbs and sensors.
+AUDIO_CLASS_RE = re.compile(r"0x(?:24|26|04|20|21|18)\w{4}")
+
+
+def bt(*args: str, timeout: float = 12.0) -> str:
+    try:
+        p = subprocess.run([BTCTL, *args], capture_output=True, text=True,
+                           timeout=timeout, check=False)
+        return p.stdout + p.stderr
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def scan(seconds: int) -> dict[str, str]:
+    """Return {mac: name} seen during a scan."""
+    subprocess.run([BTCTL, "--timeout", str(seconds), "scan", "on"],
+                   capture_output=True, text=True, timeout=seconds + 8, check=False)
+    out = bt("devices")
+    found = {}
+    for line in out.splitlines():
+        m = re.match(r"Device ([0-9A-F:]{17}) (.+)", line.strip())
+        if m:
+            found[m.group(1)] = m.group(2).strip()
+    return found
+
+
+def device_info(mac: str) -> dict[str, str]:
+    info = {}
+    for line in bt("info", mac).splitlines():
+        if ":" in line:
+            k, _, v = line.strip().partition(":")
+            info[k.strip()] = v.strip()
+    return info
+
+
+def is_audio(mac: str) -> bool:
+    info = device_info(mac)
+    cls = info.get("Class", "")
+    if AUDIO_CLASS_RE.search(cls):
+        return True
+    blob = bt("info", mac)
+    return "Audio Sink" in blob or "Advanced Audio" in blob or "Headset" in blob
+
+
+def pipewire_bt_sinks() -> list[str]:
+    """Find Bluetooth sinks via pw-dump.
+
+    Do NOT grep `wpctl status` for "bluez_output": wpctl prints the node
+    DESCRIPTION ("Bose QC45"), never the node name, so that check reports a
+    perfectly working connection as failed.
+    """
+    import json as _json
+    try:
+        out = subprocess.run(["pw-dump"], capture_output=True, text=True,
+                             timeout=10, check=False).stdout
+        objects = _json.loads(out)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return []
+    found = []
+    for obj in objects:
+        if obj.get("type") != "PipeWire:Interface:Node":
+            continue
+        props = (obj.get("info") or {}).get("props") or {}
+        if props.get("media.class") != "Audio/Sink":
+            continue
+        if props.get("device.api") != "bluez5":
+            continue
+        factory = props.get("factory.name", "")
+        profile = "A2DP" if "a2dp" in factory.lower() else "HFP/HSP (LOW QUALITY!)"
+        node_id = obj.get("id")
+        desc = props.get("node.description", "")
+        node_name = props.get("node.name", "")
+        found.append("[{}] {} -> {}  profile={}".format(node_id, desc, node_name, profile))
+    return found
+
+
+def active_codec(mac: str) -> str:
+    """Best-effort read of the negotiated A2DP codec."""
+    try:
+        out = subprocess.run(["pw-dump"], capture_output=True, text=True,
+                             timeout=10, check=False).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return "?"
+    m = re.search(r'"api\.bluez5\.codec"\s*:\s*"([^"]+)"', out)
+    return m.group(1) if m else "?"
+
+
+def connect(mac: str, name: str = "") -> int:
+    label = f"{name} ({mac})" if name else mac
+    print(f"\n==> {label}")
+
+    bt("power", "on")
+    bt("agent", "on")
+    bt("default-agent")
+    bt("pairable", "on")
+
+    info = device_info(mac)
+
+    if info.get("Paired") == "yes":
+        print("    already paired")
+    else:
+        print("    pairing ...")
+        out = bt("pair", mac, timeout=40)
+        if "Failed to pair" in out or "not available" in out.lower():
+            print(f"    PAIR FAILED: {out.strip().splitlines()[-1] if out.strip() else '?'}")
+            print("    Is the headset in PAIRING mode (not merely powered on)?")
+            return 1
+        print("    paired")
+
+    # Trust is what survives a reboot. Do not skip it.
+    print("    trusting ...")
+    bt("trust", mac)
+
+    # A single BR/EDR page attempt commonly times out even when the device
+    # is right there and ready (confirmed live: 3 straight
+    # br-connection-page-timeout failures reconnecting a Bose SL III that
+    # never left range, succeeding on the 4th attempt with nothing else
+    # changing) — retry a few times before actually giving up, same as
+    # player/bt.py's _connect_with_retry.
+    attempts, retry_delay = 5, 1.5
+    out = ""
+    for attempt in range(1, attempts + 1):
+        print(f"    connecting (attempt {attempt}/{attempts}) ...")
+        out = bt("connect", mac, timeout=30)
+        if "Failed to connect" not in out:
+            break
+        if attempt < attempts:
+            time.sleep(retry_delay)
+    if "Failed to connect" in out:
+        print(f"    CONNECT FAILED after {attempts} attempts: {out.strip().splitlines()[-1]}")
+        return 1
+
+    # Give PipeWire a moment to create the node.
+    for _ in range(12):
+        time.sleep(1.0)
+        sinks = pipewire_bt_sinks()
+        if sinks:
+            print("    connected")
+            for s in sinks:
+                print(f"      PipeWire sink: {s}")
+            print(f"      codec: {active_codec(mac)}")
+            print("\n    Route it with the Stream Deck 'BT' key, or:")
+            print("      wpctl set-default <id>   &&   mpc enable only Network")
+            return 0
+
+    print("    connected, but NO PipeWire bluez_output sink appeared.")
+    print("    Check: systemctl --user status wireplumber; wpctl status")
+    return 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Pair/connect a Bluetooth audio sink")
+    ap.add_argument("--scan", action="store_true", help="list audio devices and exit")
+    ap.add_argument("--match", help="case-insensitive substring of the device name")
+    ap.add_argument("--mac", help="exact MAC address")
+    ap.add_argument("--wait", type=int, default=30,
+                    help="seconds to keep scanning for a match (default 30)")
+    ap.add_argument("--status", action="store_true", help="show what is connected")
+    args = ap.parse_args()
+
+    if args.status:
+        print("Paired/known devices:")
+        for line in bt("devices").splitlines():
+            m = re.match(r"Device ([0-9A-F:]{17}) (.+)", line.strip())
+            if not m:
+                continue
+            info = device_info(m.group(1))
+            print(f"  {m.group(1)}  {m.group(2):28s} "
+                  f"paired={info.get('Paired','?'):3s} "
+                  f"trusted={info.get('Trusted','?'):3s} "
+                  f"connected={info.get('Connected','?')}")
+        sinks = pipewire_bt_sinks()
+        print("\nPipeWire bluetooth sinks:")
+        print("\n".join(f"  {s}" for s in sinks) if sinks else "  (none)")
+        return 0
+
+    if args.mac:
+        return connect(args.mac)
+
+    deadline = time.time() + max(args.wait, 10)
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        remaining = int(deadline - time.time())
+        print(f"scanning (pass {attempt}, {remaining}s left) ...", flush=True)
+        devices = scan(min(15, max(8, remaining)))
+
+        if args.scan:
+            print("\nAudio-capable devices:")
+            for mac, name in devices.items():
+                if is_audio(mac):
+                    print(f"  {mac}  {name}")
+            return 0
+
+        if args.match:
+            for mac, name in devices.items():
+                if args.match.lower() in name.lower():
+                    return connect(mac, name)
+
+    if args.match:
+        print(f"\nNo device matching {args.match!r} found in {args.wait}s.")
+        print("The headset must be in PAIRING mode, not just switched on.")
+        print("  Bose QC45: slide the power switch right and HOLD ~3s until you")
+        print("  hear \"ready to connect\" and the light blinks blue.")
+        print("Also disconnect it from your phone first — it will not advertise")
+        print("while it is actively connected elsewhere.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
