@@ -243,6 +243,17 @@ class TouchConfig:
     overlay_path: str = "/run/rpi-player-video/overlay.bgra"
     overlay_id: int = 90210
     tick_seconds: float = 1.0
+    # A muted, looping, near-zero-size black clip touch_daemon loads into
+    # mpv at startup, purely to force mpv to actually claim the DSI panel's
+    # DRM output. Found live on real hardware: mpv's --idle=yes with NOTHING
+    # ever loaded does not perform a DRM modeset at all on this Pi/driver
+    # combination — the text console keeps the screen indefinitely, and
+    # overlay-add has nothing to composite onto, both completely silently.
+    # Loading and looping this clip is what actually gives touch_daemon a
+    # video plane to draw the wireframe on top of during music mode; real
+    # video/karaoke playback (video mode) simply replaces it via the normal
+    # load_and_play path, same as switching between two real videos.
+    idle_clip_path: str = "/opt/rpi-player/assets/idle-black.mp4"
 
 
 @dataclass(frozen=True)
@@ -507,6 +518,7 @@ def load_config(path: Path | None = None) -> Config:
         overlay_path=touch_raw.get("overlay_path", "/run/rpi-player-video/overlay.bgra"),
         overlay_id=int(touch_raw.get("overlay_id", 90210)),
         tick_seconds=float(touch_raw.get("tick_seconds", 1.0)),
+        idle_clip_path=touch_raw.get("idle_clip_path", "/opt/rpi-player/assets/idle-black.mp4"),
     )
 
     return Config(

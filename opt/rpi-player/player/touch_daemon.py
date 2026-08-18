@@ -186,6 +186,8 @@ class TouchDaemon:
         self._overlay_visible = True
         self._last_render_at = 0.0
         self._last_pushed: bytes | None = None
+        self._overlay_error_logged = False
+        self._overlay_confirmed = False
 
         # touch-state machine
         self._down = False
@@ -216,6 +218,8 @@ class TouchDaemon:
         self._axis_x = self._axis_info(dev, ecodes.ABS_MT_POSITION_X, ecodes.ABS_X)
         self._axis_y = self._axis_info(dev, ecodes.ABS_MT_POSITION_Y, ecodes.ABS_Y)
         LOG.info("touch axis ranges: x=%s y=%s", self._axis_x, self._axis_y)
+
+        self._ensure_idle_video()
 
         LOG.info("touch daemon started")
         self._render_and_push(force=True)
@@ -409,6 +413,38 @@ class TouchDaemon:
         LOG.info("route tap -> %s", route.id)
         self._router.switch_to(route)
 
+    # -- idle video plane ----------------------------------------------------
+
+    def _ensure_idle_video(self) -> None:
+        """Load a muted, looping, near-empty black clip so mpv actually
+        claims the DSI panel's DRM output before anything real is played.
+
+        Found live on real hardware: mpv started with --idle=yes and NOTHING
+        ever loaded does not perform a DRM modeset at all on this Pi/driver
+        combination (drm-rp1-dsi) — it just never touches the display, and
+        the kernel's own text console (whatever getty is on the active VT)
+        keeps the screen indefinitely. overlay-add has nothing to composite
+        onto in that state, and fails completely silently (see the
+        overlay-add error-checking comment in _render_and_push — same
+        underlying discovery). This clip's only job is to give mpv a reason
+        to grab the display; entering video mode simply replaces it via the
+        normal load_and_play path, same as switching between two real
+        videos, so nothing else needs to know this clip exists.
+        """
+        if self._video is None or not self._touch.idle_clip_path:
+            return
+        try:
+            resp = self._video.command(["loadfile", self._touch.idle_clip_path, "replace"])
+            if not (isinstance(resp, dict) and resp.get("error") == "success"):
+                LOG.warning("could not load idle clip %r to claim the display: %s",
+                            self._touch.idle_clip_path, resp)
+                return
+            self._video.set("loop-file", "inf")
+            self._video.set("mute", True)
+            LOG.info("loaded idle clip %s to hold the DRM output", self._touch.idle_clip_path)
+        except Exception:  # noqa: BLE001 - mpv may not be up yet; not fatal, just no display
+            LOG.debug("failed to load idle clip (mpv not reachable yet?)", exc_info=True)
+
     # -- rendering -------------------------------------------------------------
 
     def _collect_state(self) -> OverlayState:
@@ -477,10 +513,33 @@ class TouchDaemon:
         try:
             Path(self._touch.overlay_path).write_bytes(frame)
             stride = layout.W * 4
-            self._video.command([
+            resp = self._video.command([
                 "overlay-add", self._touch.overlay_id, 0, 0,
                 self._touch.overlay_path, 0, "bgra", layout.W, layout.H, stride,
             ])
+            # VideoCommander.command() only raises on a SOCKET-level failure
+            # (connection refused/reset/timeout) — an mpv-level rejection of
+            # the command itself comes back as a normal JSON response like
+            # {"error": "invalid parameter", "request_id": N}, which is not
+            # an exception at all. Without this check, a bad overlay-add call
+            # (wrong path, bad format string, mpv not yet ready to accept
+            # overlays) fails completely silently: no crash, no log, nothing
+            # on screen, and no way to tell push-succeeded-but-did-nothing
+            # apart from push-never-happened. Found live: exactly this
+            # silent-failure shape on first hardware bring-up.
+            if isinstance(resp, dict) and resp.get("error") not in (None, "success"):
+                if not self._overlay_error_logged:
+                    LOG.warning("mpv rejected overlay-add: %s (path=%s, will keep "
+                                "retrying silently after this)",
+                                resp.get("error"), self._touch.overlay_path)
+                    self._overlay_error_logged = True
+            elif self._overlay_error_logged:
+                LOG.info("overlay-add succeeded after previous failure(s)")
+                self._overlay_error_logged = False
+            elif not self._overlay_confirmed:
+                LOG.info("overlay-add succeeded — overlay id %d should now be visible",
+                          self._touch.overlay_id)
+                self._overlay_confirmed = True
         except Exception:  # noqa: BLE001 - mpv may not be up yet; retried next tick
             LOG.debug("overlay push failed (mpv not reachable?)", exc_info=True)
 

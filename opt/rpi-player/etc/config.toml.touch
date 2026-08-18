@@ -356,3 +356,11 @@ overlay_id = 90210
 # readout and scrub bar keep advancing during playback (same idea as
 # streamdeck's tick_seconds for its progress key).
 tick_seconds = 1.0
+
+# Loaded and looped (muted) at startup so mpv actually claims the DSI
+# panel's DRM output before anything real is playing. Found live: mpv
+# --idle=yes with nothing ever loaded never performs a modeset on this
+# Pi/driver combination (drm-rp1-dsi) — the text console just keeps the
+# screen forever, and overlay-add silently has nothing to draw onto. Video
+# mode replaces this the normal way the moment a real video loads.
+idle_clip_path = "/opt/rpi-player/assets/idle-black.mp4"
