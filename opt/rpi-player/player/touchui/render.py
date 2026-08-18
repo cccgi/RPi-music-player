@@ -3,6 +3,36 @@ composites over whatever it's currently showing (idle/black in music mode,
 a real frame in video mode) via IPC ``overlay-add``.
 
 --------------------------------------------------------------------------
+v5: full recomposition + a REAL audio-reactive visualizer
+--------------------------------------------------------------------------
+Two changes on top of v4, both from a round of feedback that said v4 was
+still "a collection of generic buttons" rather than a deliberately
+composed screen:
+
+  1. FOLLOWS THE NEW GRID IN touchui/layout.py. Every coordinate in this
+     file that used to be hand-picked now comes from that module's HEADER/
+     CONTENT/PROGRESS/TRANSPORT zones — see its module docstring for the
+     full reasoning (the short version: v4 only used the top ~340px of a
+     480px canvas; v5 spreads the same content across the whole canvas on
+     purpose, with comparable gaps between zones instead of one big gap
+     at the bottom). The volume HUD moved from dead-center (where it used
+     to sit on top of Play/Prev/Next during a swipe — a real bug) into
+     the content zone, where it physically cannot reach the transport row.
+
+  2. THE VISUALIZER IS NOW REAL. ``state.visualizer_bars`` (set by
+     touch_daemon.py from audio_visualizer.py's FFT-over-MPD's-fifo-tap
+     reader — see that module's docstring for why this doesn't decode
+     audio twice) replaces the old deterministic sine-wave placeholder.
+     Empty/all-zero bars just draw as flat -- this file doesn't know or
+     care whether that's "no numpy installed", "fifo not connected yet",
+     or "genuinely silent"; touch_daemon.py is where that distinction
+     matters. The visualizer is drawn ONLY when a track is actually
+     loaded (state.title truthy) -- not for "Nothing playing" -- and
+     naturally freezes/decays while paused rather than jumping, because
+     the reader thread keeps decaying its own smoothed levels once MPD
+     stops writing new PCM (see audio_visualizer.py's _decay_to_silence).
+
+--------------------------------------------------------------------------
 v4: real album art, volume off the bottom bar, Scan out of the transport row
 --------------------------------------------------------------------------
 Three changes on top of v3's size/color hierarchy, from a round of
@@ -134,6 +164,8 @@ class OverlayState:
     pressed_action: str = ""            # action name of the currently-held-down button, if any
     art_image: object = None            # PIL.Image (RGBA) or None -- see module docstring, item 1
     volume_hud_visible: bool = False    # transient volume HUD -- see module docstring, item 2
+    visualizer_bars: list = field(default_factory=list)  # real levels 0.0-1.0, see v5 docstring
+    scanning: bool = False              # library rescan in progress -- see _scan_util_btn
 
 
 def _hex_rgba(h: str, alpha: int = 255) -> tuple[int, int, int, int]:
@@ -176,10 +208,11 @@ class Renderer:
             draw = ImageDraw.Draw(img)
             self._draw_art_panel(draw, img, state, accent, opaque)
             self._draw_header(draw, state, accent, opaque)
-            if state.mode == "music":
+            if state.mode == "music" and state.title:
                 # Video mode never shows the visualizer -- it prioritizes
-                # the video image itself (see module docstring, VIDEO mode
-                # paragraph).
+                # the video image itself. Music mode only shows it once a
+                # track is actually loaded -- not for "Nothing playing"
+                # (spec: don't animate an equalizer over an empty state).
                 self._draw_visualizer(draw, state, accent)
             self._draw_scrub(draw, state, accent, opaque)
             self._draw_transport(img, draw, state, accent, opaque)
@@ -229,6 +262,21 @@ class Renderer:
         x, y = pos
         draw.text((x + 1, y + 1), text, font=font, fill=(0, 0, 0, 170))
         draw.text((x, y), text, font=font, fill=fill)
+
+    def _ellipsize(self, draw, text: str, font, max_width: float) -> str:
+        """Truncate ``text`` with a trailing "..." so it never exceeds
+        ``max_width`` — spec: "never overlap neighboring elements, never
+        force the entire layout to move." Cheap linear trim rather than a
+        binary search; title/artist/album strings are short enough that
+        this never runs more than a handful of iterations.
+        """
+        if max_width <= 0 or draw.textlength(text, font=font) <= max_width:
+            return text
+        ellipsis = "..."
+        trimmed = text
+        while trimmed and draw.textlength(trimmed + ellipsis, font=font) > max_width:
+            trimmed = trimmed[:-1]
+        return (trimmed + ellipsis) if trimmed else ellipsis
 
     def _secondary_pill(self, draw, rect, icon_fn, text, accent=None, active=False,
                          muted=False, opaque=True) -> None:
@@ -369,26 +417,38 @@ class Renderer:
                            active=state.route_icon == "airplay",
                            muted=not state.airplay_available and state.route_icon != "airplay")
         scan_rect = layout.SCAN_UTIL_V.rect if state.mode == "video" else layout.SCAN_UTIL.rect
-        self._scan_util_btn(draw, scan_rect, opaque=opaque)
+        self._scan_util_btn(draw, scan_rect, opaque=opaque, scanning=state.scanning)
         # Bumped from muted/200/r=2.2 -- on the actual DSI panel (per a
         # hardware photo) this landed almost invisible next to the
         # source pills' higher-contrast fills. fg_secondary + slightly
         # bigger dots keeps it a quiet decorative element, just legible.
         _menu_dots(draw, layout.MENU_DOTS_RECT, _hex_rgba(t.fg_secondary, 220))
 
-        title_x = layout.MODE_PILL.rect[0]
+        # Title/artist/album/tags column: aligned with INFO_COLUMN_X (to
+        # the right of the art panel), NOT the header's MODE_PILL -- v5's
+        # header and content zones are two separate rows now (see
+        # layout.py), so the two are no longer coincidentally aligned.
+        # Text is clipped to end before the visualizer starts (spec: "if a
+        # title is too long, truncate with an ellipsis -- never overlap
+        # neighboring elements") rather than letting a long title run into
+        # the bars.
+        title_x = layout.INFO_COLUMN_X
+        text_max_w = layout.VISUALIZER_RECT[0] - title_x - 16
         title = state.title or ("Nothing playing" if state.mode == "music" else "No video loaded")
-        self._shadowed_text(draw, (title_x, 74), title, self._font_title, _hex_rgba(t.fg))
+        title = self._ellipsize(draw, title, self._font_title, text_max_w)
+        self._shadowed_text(draw, (title_x, 88), title, self._font_title, _hex_rgba(t.fg))
         if state.artist:
-            self._shadowed_text(draw, (title_x, 110), state.artist, self._font_sub,
+            artist = self._ellipsize(draw, state.artist, self._font_sub, text_max_w)
+            self._shadowed_text(draw, (title_x, 124), artist, self._font_sub,
                                  _hex_rgba(t.fg_secondary, 235))
         if state.meta_line:
-            self._shadowed_text(draw, (title_x, 134), state.meta_line, self._font_meta,
+            meta = self._ellipsize(draw, state.meta_line, self._font_meta, text_max_w)
+            self._shadowed_text(draw, (title_x, 148), meta, self._font_meta,
                                  _hex_rgba(t.muted, 235))
 
         # format-tag chips (FLAC/24-bit/96kHz/2ch, or 1920x1080/H.264/16:9/29.97fps)
         tx = title_x
-        ty = 162
+        ty = 178
         for tag in state.tags:
             tw = draw.textlength(tag, font=self._font_tag) + 16
             draw.rounded_rectangle([tx, ty, tx + tw, ty + 22], radius=6,
@@ -419,46 +479,67 @@ class Renderer:
         icon_fn(draw, icon_cx, y + h / 2, icon_s, fg)
         draw.text((icon_cx + icon_s * 1.15, y + h / 2), text, font=self._font_tag, fill=fg, anchor="lm")
 
-    def _scan_util_btn(self, draw, rect, opaque) -> None:
+    def _scan_util_btn(self, draw, rect, opaque, scanning: bool = False) -> None:
         """Small circular rescan/refresh icon in the header's status
         cluster — v4 moved this out of the transport row specifically so
         it's not adjacent to Delete (see module docstring, item 3). A
         library-scope action (not a per-track control), so it lives with
         the other status/utility controls rather than the playback ones.
+
+        ``scanning`` -- an obvious-but-subtle active state while a scan is
+        in progress (touch_daemon.py sets this from MPD's own
+        ``updating_db`` status field for music, or a short timed pulse for
+        video's synchronous rescan — see touch_daemon's _collect_state and
+        _dispatch_button). Solid scan-accent fill instead of neutral, not
+        an animation loop — a per-frame spinner would mean redrawing/
+        pushing a new overlay frame every render tick purely for motion,
+        which is the kind of unnecessary CPU spend this round's spec
+        explicitly asked to avoid.
         """
         t = self._theme
         x, y, w, h = rect
         r = min(w, h) / 2
         cx, cy = x + w / 2, y + h / 2
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r],
-                     outline=_hex_rgba(t.border, 220 if opaque else 90),
-                     width=2, fill=_hex_rgba(t.elevated, 220 if opaque else 55))
-        _scan_glyph(draw, cx, cy, r * 0.6, _hex_rgba(t.scan, 235))
+        if scanning:
+            border = _hex_rgba(t.scan, 255)
+            fill = _hex_rgba(t.scan, 90 if opaque else 70)
+            glyph_fg = _hex_rgba(t.fg)
+        else:
+            border = _hex_rgba(t.border, 220 if opaque else 90)
+            fill = _hex_rgba(t.elevated, 220 if opaque else 55)
+            glyph_fg = _hex_rgba(t.scan, 235)
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=border, width=2, fill=fill)
+        _scan_glyph(draw, cx, cy, r * 0.6, glyph_fg)
 
-    # -- decorative "spectrum" strip -----------------------------------------------
+    # -- REAL audio-reactive spectrum strip ----------------------------------------
 
     def _draw_visualizer(self, draw, state: OverlayState, accent: str) -> None:
-        """Stylized, deterministic bar pattern — NOT real audio analysis
-        (see module docstring). Derived from elapsed playback time so it
-        visibly shifts while something is playing and sits flat/still
-        when nothing is, without ever being presented as a real spectrum.
+        """Real per-band audio levels (state.visualizer_bars, 0.0-1.0 each
+        — see audio_visualizer.py and this file's v5 docstring), NOT the
+        deterministic placeholder pattern earlier versions used. Only
+        called when a track is loaded (render()'s caller already checks
+        state.title) — bars naturally read near-zero while paused/idle
+        since the reader thread decays them when MPD stops writing PCM,
+        so this doesn't need its own separate "paused" branch.
+
+        Small on purpose (VISUALIZER_BAR_COUNT bars, not 24+) — spec:
+        "complement the artwork rather than compete with it."
         """
-        t = self._theme
         x, y, w, h = layout.VISUALIZER_RECT
-        n_bars = 24
-        bar_w = w / n_bars * 0.6
+        n_bars = layout.VISUALIZER_BAR_COUNT
+        bars = state.visualizer_bars
+        if len(bars) != n_bars:
+            # Defensive only -- audio_visualizer.py always returns exactly
+            # bar_count levels; this just keeps a mismatched/empty list
+            # (e.g. visualizer unavailable) from ever indexing out of range.
+            bars = (list(bars) + [0.0] * n_bars)[:n_bars]
+
+        bar_w = w / n_bars * 0.55
         gap = w / n_bars
-        moving = state.mode == "music" and state.playing or state.mode == "video" and state.playing
-        phase = state.elapsed if moving else 0.0
-        for i in range(n_bars):
-            # Smooth, non-repeating-looking pseudo-pattern from a couple
-            # of out-of-phase sine waves — deliberately NOT random per
-            # frame (that would just look like flicker/noise).
-            v = (math.sin(phase * 2.2 + i * 0.9) * 0.5
-                 + math.sin(phase * 1.3 + i * 0.4) * 0.3
-                 + 0.5)
-            v = max(0.08, min(1.0, v))
-            bh = h * v
+        min_h = h * 0.06  # a faint baseline sliver even at zero, not a blank gap
+        for i, level in enumerate(bars):
+            level = max(0.0, min(1.0, level))
+            bh = max(min_h, h * level)
             bx = x + i * gap
             draw.rounded_rectangle([bx, y + h - bh, bx + bar_w, y + h], radius=bar_w / 2,
                                     fill=_hex_rgba(accent, 190))
@@ -531,7 +612,14 @@ class Renderer:
         x, y, w, h = play_rect
         cx, cy = x + w / 2, y + h / 2
         r = max(w, h) / 2
-        self._glow(img, cx, cy, r * 1.25, _hex_rgba(accent, 130 if opaque else 90), blur=10)
+        # v5: reduced significantly from v4's (r*1.25, alpha 130/90) per
+        # explicit spec feedback on a real render -- "strong blue/purple
+        # halos... reduce this significantly." Smaller radius multiplier
+        # (less spread), lower alpha (less intensity), and a softer blur
+        # (spreads what's left more thinly instead of a bright ring) all
+        # move in the same direction: still a visible "this is the
+        # dominant control" cue, no longer a neon glow.
+        self._glow(img, cx, cy, r * 1.05, _hex_rgba(accent, 60 if opaque else 45), blur=16)
         draw.ellipse([x, y, x + w, y + h], fill=_hex_rgba(accent, 235 if opaque else 90),
                      outline=_hex_rgba(accent, 255), width=2)
         s = h * 0.24

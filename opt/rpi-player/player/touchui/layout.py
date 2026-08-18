@@ -4,67 +4,71 @@ never drift apart — same rationale as player/streamdeck/layout.py for the
 Stream Deck's 8x4 grid.
 
 --------------------------------------------------------------------------
+v5: full recomposition -- a deliberate grid, not stacked widgets
+--------------------------------------------------------------------------
+v3/v4 fixed CONTROL HIERARCHY (different shapes per importance tier) and
+STRUCTURE (Scan away from Delete, volume off the bottom bar), but a real
+hardware photo after those landed showed the underlying problem was never
+actually fixed: everything was still anchored to the top of the screen,
+leaving roughly a third of the 480px canvas as dead space below the
+transport row, while the header felt cramped. v5 is a genuine recompose,
+not another round of nudging existing rects:
+
+    y=20            HEADER        mode pill (left), volume readout +
+                                   source pills + scan + menu (right)
+    y=72-240        CONTENT       168px art panel (left) + title/artist/
+                                   album/tags (center) + a small 16-bar
+                                   visualizer (upper-right)
+    y=254-284       PROGRESS      scrub bar + time labels
+    y=314-414       TRANSPORT     favorite / prev / play / next / delete
+    y=414-480       (66px of deliberate bottom margin)
+
+Every zone's height was chosen so the WHOLE canvas is used on purpose --
+the old layout only used roughly the top 340px and called the remaining
+140px "done"; here the gaps between zones (14-30px) and the 66px bottom
+margin are close in scale to each other, which is what makes empty space
+read as "designed" rather than "leftover after moving things around."
+
+Two other concrete v5 changes:
+
+  * VOLUME_COMPACT_RECT got real room (170x38, up from 228x20) instead of
+    cramming a speaker icon + bars + percentage into a 20px-tall sliver.
+  * VOLUME_HUD_RECT moved into the CONTENT zone (y=90-180) instead of
+    dead center of the screen, specifically so it can never overlap the
+    transport row -- a real bug in v4 (the HUD sat directly over
+    Play/Prev/Next during a swipe).
+
+--------------------------------------------------------------------------
 v4: Scan out of the transport row, volume off the bottom bar
 --------------------------------------------------------------------------
-Two structural changes on top of v3's size hierarchy, both from this
-round's feedback on a real hardware photo:
-
-  1. SCAN/RESCAN MOVED OUT OF THE TRANSPORT ROW. v3 put it where the
-     design spec's orange "Playlist" slot sits, right next to DELETE —
-     flagged explicitly this round as "a dangerous UI collision: do not
-     place [REFRESH] [DELETE] next to each other." It's now a small
-     circular utility icon in the header's status cluster (SCAN_UTIL /
-     SCAN_UTIL_V), spatially far from Delete and grouped with the other
-     status/utility controls (source pills, overflow menu) it actually
-     belongs with conceptually — it affects the LIBRARY, not the
-     currently-playing track.
-
-     This still leaves no real playlist/queue screen behind an orange
-     "Playlist" button (out of scope to build one now — same call as
-     v3, restated: no feature invented just to fill a slot). The
-     transport row simply has one fewer tertiary control than the
-     reference mockup's PLAYLIST+DELETE pair; flagged as a documented
-     follow-up rather than faked.
-
-  2. VOLUME BAR REMOVED FROM THE BOTTOM OF THE SCREEN. v2/v3 both had a
-     full-width draggable VOLUME_BAR along the bottom edge — explicitly
-     called out this round as something to remove: "the old large
-     volume bar at the bottom MUST BE REMOVED... instead display a
-     compact volume indicator in the top/status area" plus swipe
-     up/down (already implemented — see touch_daemon.py's
-     _handle_content_gesture) as the only way to actually change it.
-     VOLUME_COMPACT_RECT (persistent, tiny, header area) and
-     VOLUME_HUD_RECT (transient, appears only while a volume swipe is
-     live or just ended, then auto-hides — see render.py's
-     _draw_volume_hud and touch_daemon's _volume_hud_until) replace it.
-     Neither is a Button: both are read-only displays, not drag
-     targets — the swipe-anywhere gesture is now the only volume input.
+  1. SCAN/RESCAN MOVED OUT OF THE TRANSPORT ROW into the header's status
+     cluster as a small circular utility icon (SCAN_UTIL/SCAN_UTIL_V) --
+     specifically so it's never adjacent to DELETE ("a dangerous UI
+     collision"). Still no real playlist/queue screen behind an orange
+     "Playlist" slot -- out of scope, documented rather than faked.
+  2. VOLUME BAR REMOVED FROM THE BOTTOM OF THE SCREEN. Swipe up/down
+     (touch_daemon.py's _handle_content_gesture) is the only volume
+     input now; VOLUME_COMPACT_RECT/VOLUME_HUD_RECT are read-only
+     displays, not Buttons.
 
 --------------------------------------------------------------------------
 v3: control HIERARCHY, not just restyling
 --------------------------------------------------------------------------
-v2 gave every control the same pill treatment ("FAVORITE, PREVIOUS, PLAY,
-NEXT, DELETE all look like variations of the same generic button" — the
-explicit complaint that triggered this pass). v3 sizes each control by
-its importance instead of using one shape for everything:
+Controls are sized by importance, not one shape for everything:
 
-  PRIMARY   Play/Pause — PLAY_BTN[_V]. A big circle, substantially larger
-            than everything else (100px vs. 52-95px), the only control
-            that glows.
-  SECONDARY Previous/Next — PREV_BTN[_V]/NEXT_BTN[_V]. Compact rounded
-            rects with icon + text, neutral gray, no accent color.
-  TERTIARY  Favorite, Delete — CURATE_BTN[_V], DELETE_BTN[_V]. Small
-            (52x52) icon-only squares, visually subordinate on purpose
-            (per the design spec: "Do not allow DELETE to visually
-            compete with PLAY"). Karaoke/Vocal (video only) is the one
-            tertiary control with a text label (VOCAL/KARAOKE toggle
-            state has to be readable), so it's sized like a secondary
-            control instead.
+  PRIMARY   Play/Pause -- PLAY_BTN[_V]. A large circle, the only control
+            that glows (kept subtle per this round's feedback -- v4/v3
+            both leaned too hard on glow).
+  SECONDARY Previous/Next -- PREV_BTN[_V]/NEXT_BTN[_V]. Compact rounded
+            rects with icon + text, neutral gray.
+  TERTIARY  Favorite, Delete -- CURATE_BTN[_V], DELETE_BTN[_V]. Small
+            icon-only squares, visually subordinate on purpose. Karaoke/
+            Vocal (video only) needs a text label, so it's sized like a
+            secondary control instead.
 
-The transport row's x-positions below are hand-centered as a group per
-mode (5 controls in music, 6 in video) — see the inline comments at each
-rect for the arithmetic, so a future resize has the reasoning next to the
-numbers, not just the numbers.
+The transport row's x-positions are hand-centered as a group per mode (5
+controls in music, 6 in video) -- see the inline comments at each rect for
+the arithmetic.
 
 --------------------------------------------------------------------------
 Coordinate space and the 180-degree rotation contract
@@ -105,90 +109,106 @@ class Button:
     modes: tuple[str, ...] = ("music", "video")         # which mode(s) show it
 
 
-# -- album art panel (top-left) ----------------------------------------------
-ART_RECT = (20, 24, 168, 168)
-# Small heart badge overlaid on the art's top-left corner — a second,
+# -- HEADER zone: y 20-58 (button HIT rects are 44 tall, y20-64 -- see note) --
+# Header pills are visually drawn within the 38px-tall header band, but
+# each Button's rect (the tap-hit area) is grown to 44px tall, the touch
+# target minimum this spec calls for ("touch targets >=44px even if
+# visuals are minimal") -- there's an 8px gap before CONTENT starts at
+# y=72, so this costs nothing layout-wise. Verified via the touch-target
+# check alongside the collision/bounds checks (all in the sandbox's
+# preview harness) -- see the delivery notes for the one deliberate
+# exception (SCRUB_BAR, a thin scrub/slider, kept below 44px tall on
+# purpose; see its own comment).
+MODE_PILL = Button("_toggle_mode", (20, 20, 112, 44), "MODE")
+
+# Compact, ALWAYS-VISIBLE volume readout (speaker icon + tick bars +
+# percentage) -- read-only, not a Button (no touch-target requirement
+# applies). Sits in the gap between the mode pill and the source-pill
+# cluster, with real room this round (170x38 vs v4's cramped 228x20) per
+# the spec: "give it enough breathing room."
+VOLUME_COMPACT_RECT = (242, 20, 170, 38)
+
+# Right-aligned status/utility cluster: STORAGE(84) + BT(84) + AP(84) +
+# SCAN(44) + DOTS(24) = 320, plus 4x10 gaps = 40 -> 360 total, ending at
+# x=788. Hit-rect heights are 44 (see MODE_PILL's comment above); visual
+# drawing still uses the 38px header band.
+STORAGE_PILL = Button("_toggle_storage", (428, 20, 84, 44), "INT/USB")
+BT_PILL      = Button("_open_bt",        (522, 20, 84, 44), "BT")
+AIRPLAY_PILL = Button("_open_airplay",   (616, 20, 84, 44), "AirPlay")
+# Library rescan (update_database / video_rescan) -- a small circular
+# utility icon, deliberately far from DELETE (see module docstring).
+# Widened from 36 to 44 for the same touch-target reason as the pills
+# above; still comfortably short of MENU_DOTS_RECT at x=756 (2px gap).
+SCAN_UTIL   = Button("update_database", (710, 20, 44, 44), "scan")
+SCAN_UTIL_V = Button("video_rescan",    SCAN_UTIL.rect,    "scan", modes=("video",))
+# The 3-dot overflow icon is deliberately NOT a Button -- no settings
+# screen exists behind it yet. render.py draws it as an inert decoration.
+MENU_DOTS_RECT = (756, 20, 24, 38)
+
+# -- CONTENT zone: y 72-240 ---------------------------------------------------
+ART_RECT = (20, 72, 168, 168)
+# Small heart badge overlaid on the art's top-left corner -- a second,
 # larger tap target for curate/favorite than the tiny tertiary transport
-# button, mirroring the mockup exactly (it shows a heart badge ON the
-# art). Same action as CURATE_BTN below, just a second rect that reaches
-# it — hit_test() doesn't care which rect fired.
-ART_BADGE   = Button("curate_current",       (26, 30, 34, 34), "curate")
+# button. Same action as CURATE_BTN, just a second rect that reaches it.
+# 44x44 (touch-target minimum) fits comfortably inside the 168x168 art
+# panel without reaching its opposite edges.
+ART_BADGE   = Button("curate_current",       (26, 78, 44, 44), "curate")
 ART_BADGE_V = Button("video_curate_current", ART_BADGE.rect,   "curate", modes=("video",))
 
-# -- top-right source/status/utility cluster (compact — these are STATUS
-# controls, not primary playback controls, per the design spec) -------------
-# Right-aligned as a group: STORAGE(80) + BT(80) + AP(80) + SCAN(32) +
-# DOTS(24) = 296, plus 4x8 gaps = 32 -> 328 total, ending at x=780 (20px
-# right margin, matching ART_RECT's 20px left margin) -> starts at 452.
-MODE_PILL    = Button("_toggle_mode",    (204, 24, 108, 36), "MODE")
-STORAGE_PILL = Button("_toggle_storage", (452, 24, 80, 32), "INT/USB")
-BT_PILL      = Button("_open_bt",        (540, 24, 80, 32), "BT")
-AIRPLAY_PILL = Button("_open_airplay",   (628, 24, 80, 32), "AirPlay")
-# Library rescan (update_database / video_rescan) — moved here in v4,
-# OUT of the transport row, specifically so it's nowhere near DELETE (see
-# module docstring, item 1: "do not place [REFRESH] [DELETE] next to
-# each other"). A small circular utility icon grouped with the other
-# status controls it conceptually belongs with.
-SCAN_UTIL   = Button("update_database", (716, 24, 32, 32), "scan")
-SCAN_UTIL_V = Button("video_rescan",    SCAN_UTIL.rect,    "scan", modes=("video",))
-# The 3-dot overflow icon in the top-right corner (spec item 8) is
-# deliberately NOT a Button — there's no settings/overflow screen behind
-# it yet, and inventing one wasn't asked for. render.py draws it as an
-# inert decoration; wire it up here (a real rect + hit_test entry) the day
-# there's an actual menu for it to open.
-MENU_DOTS_RECT = (756, 24, 24, 32)
+# Title/artist/album/tags column starts here (art ends at x=188, +20 gap).
+INFO_COLUMN_X = 208
 
-# Compact, ALWAYS-VISIBLE volume readout (v4: replaces the old bottom
-# VOLUME_BAR) — speaker icon + a handful of tick bars + percentage text,
-# sitting in the header band just above the visualizer. Read-only: not a
-# Button, nothing to hit-test — see module docstring, item 2.
-VOLUME_COMPACT_RECT = (556, 72, 228, 20)
+# Real audio-reactive visualizer (MUSIC ONLY -- see audio_visualizer.py
+# and render.py's module docstring for where the data comes from and why
+# video never shows it). Small and upper-right of the content zone, per
+# spec: "occupy a relatively small area... complement the artwork rather
+# than compete with it." 16 bars, not 24+.
+VISUALIZER_RECT = (568, 72, 212, 52)
+VISUALIZER_BAR_COUNT = 16
 
-# Decorative spectrum visualizer (spec item 10) — NOT real-time audio
-# analysis (no FFT/spectrum data is available to this daemon; see
-# render.py's docstring for why a stylized deterministic pattern was used
-# instead of faking live data). MUSIC MODE ONLY (spec: video must not show
-# it — video prioritizes the video image itself). Non-interactive, no
-# Button entry needed.
-VISUALIZER_RECT = (556, 96, 228, 56)
-
-# Transient volume HUD (v4) — a centered card that appears only while a
-# volume swipe is live or has just ended, then auto-hides after ~1.5s
-# (touch_daemon's _volume_hud_until / OverlayState.volume_hud_visible).
-# Sized/centered independent of whatever else is on screen since it draws
-# on top of everything, including a fully-hidden overlay.
-VOLUME_HUD_RECT = (300, 195, 200, 90)
-
-# -- scrub bar ----------------------------------------------------------------
-SCRUB_BAR = Button("_seek_absolute", (20, 226, 764, 14), "seek")
-
-# -- bottom transport row: PRIMARY / SECONDARY / TERTIARY hierarchy ----------
-# Common row centerline cy=300; each tier is a different height, all
-# vertically centered on it (see the module docstring for the hierarchy
-# rationale).
+# Transient volume HUD -- appears only while a volume swipe is live or has
+# just ended (~1.5s hold, see touch_daemon._volume_hud_until), then
+# disappears. Positioned INSIDE the content zone (never over the
+# transport row) -- v4 got this wrong (HUD sat on top of Play/Prev/Next
+# during a swipe); this rect physically cannot reach y=314+ where
+# transport starts.
 #
-# Music: 5 controls (favorite/prev/play/next/delete) since v4 moved Scan
-# out -> width 52+95+100+95+52=394, plus 4x14 gaps=56 -> 450 total, so it
-# starts at (800-450)/2=175 (175px margin each side, symmetric).
-CURATE_BTN = Button("curate_current",    (175, 274, 52, 52), "curate")   # tertiary
-PREV_BTN   = Button("prev_track",        (241, 270, 95, 60), "prev")    # secondary
-PLAY_BTN   = Button("toggle_pause",      (350, 250, 100, 100), "play/pause")  # primary
-NEXT_BTN   = Button("next_track",        (464, 270, 95, 60), "next")    # secondary
-DELETE_BTN = Button("delete_current",    (573, 274, 52, 52), "delete")  # tertiary
-# Video adds Karaoke/Vocal after Delete — needs a text label (state
-# toggles between VOCAL/KARAOKE), so it's sized like a secondary control.
-# 6 controls -> width 394+112=506, plus 5x14 gaps=70 -> 576 total, starts
-# at (800-576)/2=112 (112px margin each side, symmetric).
-VOCAL_BTN  = Button("switch_track",      (576, 270, 112, 60), "vocal", modes=("video",))
+# Width widened from v5's first pass (200) to 360: a preview render with
+# a real-length title ("Bohemian Rhapsody") showed the old narrower card
+# clipping the title text at both edges -- letters peeking out to the
+# left and right of the HUD card instead of the card cleanly covering it
+# -- which read as broken, not intentional. 360 covers the full
+# _ellipsize()'d title width (text_max_w = VISUALIZER_RECT[0] -
+# INFO_COLUMN_X - 16 = 344px, see render.py's _draw_header) with margin
+# to spare, while staying clear of both ART_RECT (ends x=188) and
+# VISUALIZER_RECT (starts x=568).
+VOLUME_HUD_RECT = (200, 90, 360, 90)
 
-# Video-mode equivalents of the five music actions above — same rect
-# ARITHMETIC as music (shifted as a group from 175-start to 112-start,
-# i.e. -63px each), same label, different actions.py entry point.
-CURATE_BTN_V = Button("video_curate_current", (112, 274, 52, 52),  "curate", modes=("video",))
-PREV_BTN_V   = Button("video_prev_song",      (178, 270, 95, 60),  "prev",   modes=("video",))
-PLAY_BTN_V   = Button("video_play_pause",     (287, 250, 100, 100), "play/pause", modes=("video",))
-NEXT_BTN_V   = Button("video_next_song",      (401, 270, 95, 60),  "next",   modes=("video",))
-DELETE_BTN_V = Button("video_delete_current", (510, 274, 52, 52),  "delete", modes=("video",))
+# -- PROGRESS zone: y 254-284 -------------------------------------------------
+SCRUB_BAR = Button("_seek_absolute", (20, 270, 764, 14), "seek")
+
+# -- TRANSPORT zone: y 314-414, hierarchy per module docstring ---------------
+# Common centerline cy=364. Music: 5 controls (favorite/prev/play/next/
+# delete) -> width 58+104+100+104+58=424, plus 4x16 gaps=64 -> 488 total,
+# starts at (800-488)/2=156 (symmetric 156px margins).
+CURATE_BTN = Button("curate_current",    (156, 335, 58, 58), "curate")   # tertiary
+PREV_BTN   = Button("prev_track",        (230, 331, 104, 66), "prev")   # secondary
+PLAY_BTN   = Button("toggle_pause",      (350, 314, 100, 100), "play/pause")  # primary
+NEXT_BTN   = Button("next_track",        (466, 331, 104, 66), "next")   # secondary
+DELETE_BTN = Button("delete_current",    (586, 335, 58, 58), "delete")  # tertiary
+# Video adds Karaoke/Vocal after Delete -- needs a text label, sized like
+# a secondary control. 6 controls -> 488+16+124=628 total, starts at
+# (800-628)/2=86 (symmetric 86px margins).
+VOCAL_BTN = Button("switch_track", (590, 331, 124, 66), "vocal", modes=("video",))
+
+# Video-mode equivalents of the five music actions above -- same
+# arithmetic, shifted as a group by -70px (156->86), same label, different
+# actions.py entry point.
+CURATE_BTN_V = Button("video_curate_current", (86, 335, 58, 58),   "curate", modes=("video",))
+PREV_BTN_V   = Button("video_prev_song",      (160, 331, 104, 66), "prev",   modes=("video",))
+PLAY_BTN_V   = Button("video_play_pause",     (280, 314, 100, 100), "play/pause", modes=("video",))
+NEXT_BTN_V   = Button("video_next_song",      (396, 331, 104, 66), "next",   modes=("video",))
+DELETE_BTN_V = Button("video_delete_current", (516, 335, 58, 58),  "delete", modes=("video",))
 
 # Whole screen. Plain tap (no direction ever locked in — see
 # touch_daemon.py's _on_touch_up) toggles hide/show. A vertical drag
@@ -204,11 +224,9 @@ CONTENT_AREA = Button("_toggle_overlay", (0, 0, W, H), "content")
 # NOT an action — SCAN_UTIL must stay out of _SHARED, or hit_test() in
 # video mode would match it (earlier in the concatenated list) before ever
 # reaching SCAN_UTIL_V at the same coordinates, silently calling
-# update_database (the music action) instead of video_rescan. Found this
-# exact class of bug once already in this file (ART_BADGE vs. CURATE_BTN
-# colliding in render.py's by-action dict) — same root cause, different
-# spot: two Buttons sharing a rect must never share an action name AND
-# both be reachable in the same mode's hit_test list.
+# update_database (the music action) instead of video_rescan. Two Buttons
+# sharing a rect must never share an action name AND both be reachable in
+# the same mode's hit_test list.
 _MUSIC_ONLY = (CURATE_BTN, PREV_BTN, PLAY_BTN, NEXT_BTN, DELETE_BTN, ART_BADGE, SCAN_UTIL)
 _VIDEO_ONLY = (CURATE_BTN_V, PREV_BTN_V, PLAY_BTN_V, NEXT_BTN_V, DELETE_BTN_V,
                VOCAL_BTN, ART_BADGE_V, SCAN_UTIL_V)

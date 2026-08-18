@@ -54,6 +54,7 @@ from .actions import (
     music_storage_label,
     video_storage_label,
 )
+from .audio_visualizer import AudioVisualizer
 from .config import Config, load_config, setup_logging
 from . import mode as _mode
 from .ipc import BusServer, NullBus
@@ -109,6 +110,15 @@ _GESTURE_DEADZONE = 14  # logical pixels
 # starts counting down once the finger actually stops/lifts. Per the spec:
 # "automatically disappear after approximately 1-2 seconds."
 _VOLUME_HUD_HOLD = 1.5
+
+# How long the video-mode scan "activity" state stays visually on after a
+# rescan tap — video.py's VideoLibrary.rescan() is synchronous with no
+# progress/completion signal to poll, unlike MPD's own updating_db field
+# (used directly for music-mode scanning below), so this is a fixed pulse
+# rather than a true "still running" indicator. Long enough to read as
+# real feedback for a directory walk of a typical library, short enough
+# that it can't get stuck "on" if rescan() throws.
+_VIDEO_SCAN_PULSE_HOLD = 2.0
 
 
 def find_touch_device(explicit_path: str = "") -> "evdev.InputDevice | None":
@@ -265,11 +275,34 @@ class TouchDaemon:
         # a cache of ~168x168 thumbnails.
         self._art_cache: dict[str, "Image.Image | None"] = {}
 
+        # Real audio-reactive visualizer (music mode only) — see
+        # audio_visualizer.py's module docstring. Instantiated here
+        # unconditionally (cheap: just sets up state, no fifo open happens
+        # until .start()); the fifo path comes from config so it stays in
+        # sync with system/mpd.conf's "Visualizer" output block without
+        # duplicating the path as a second hardcoded constant.
+        self._visualizer = AudioVisualizer(
+            fifo_path=config.touch.visualizer_fifo_path,
+            bar_count=layout.VISUALIZER_BAR_COUNT,
+        )
+
+        # Video-mode scan pulse — VideoLibrary.rescan() (video.py) is
+        # synchronous with no async "still running" signal to poll (unlike
+        # MPD's own status()['updating_db'] for music, read live in
+        # _collect_state). So a video rescan tap just arms a short timed
+        # pulse here, mirrored into state.scanning the same way the volume
+        # HUD mirrors self._volume_hud_until — good enough to satisfy the
+        # spec's "obvious but subtle activity state while running" without
+        # needing a second thread or a completion callback video.py doesn't
+        # have. See _dispatch_button and _apply_scan_pulse.
+        self._video_scan_pulse_until: float = 0.0
+
     # -- lifecycle -----------------------------------------------------------
 
     def stop(self, *_: object) -> None:
         LOG.info("shutting down")
         self._running = False
+        self._visualizer.stop()
 
     def run(self) -> int:
         signal.signal(signal.SIGTERM, self.stop)
@@ -288,6 +321,7 @@ class TouchDaemon:
         LOG.info("touch axis ranges: x=%s y=%s", self._axis_x, self._axis_y)
 
         self._ensure_idle_video()
+        self._visualizer.start()
 
         LOG.info("touch daemon started")
         self._render_and_push(force=True)
@@ -566,6 +600,27 @@ class TouchDaemon:
             self._tap_route_icon("bluetooth")
         elif action == "_open_airplay":
             self._tap_route_icon("airplay")
+        elif action == "update_database":
+            # Debounce: MPD itself refuses a second concurrent update, but
+            # it does so by returning an error we'd otherwise just swallow
+            # -- checking updating_db first avoids spamming that error and
+            # matches the spec's explicit "prevent duplicate/overlapping
+            # scan triggers" requirement.
+            if self._mpd.status().get("updating_db"):
+                LOG.info("scan tap ignored -- a scan is already in progress")
+            else:
+                dispatch(action, self._ctx)
+        elif action == "video_rescan":
+            # No async completion signal exists for this synchronous call
+            # (see __init__'s comment on _video_scan_pulse_until), so a
+            # rescan that's already "pulsing" just re-arms the same pulse
+            # instead of firing a second directory walk.
+            now = time.monotonic()
+            if now < self._video_scan_pulse_until:
+                LOG.info("video scan tap ignored -- a scan pulse is already active")
+            else:
+                dispatch(action, self._ctx)
+                self._video_scan_pulse_until = now + _VIDEO_SCAN_PULSE_HOLD
         elif action.startswith("_"):
             LOG.warning("unhandled pseudo-action %r", action)
         else:
@@ -663,6 +718,7 @@ class TouchDaemon:
             media_path = vstat.get("path", "")
             state.curated = bool(media_path) and "Curated" in Path(media_path).parts
             state.tags = self._video_format_tags()
+            state.scanning = time.monotonic() < self._video_scan_pulse_until
         else:
             mstat = self._mpd.status()
             song = self._mpd.current_song()
@@ -681,6 +737,19 @@ class TouchDaemon:
             state.meta_line = _album_meta_line(song)
             state.tags = _music_format_tags(song_file, mstat.get("audio", ""))
             state.art_image = self._get_album_art(song_file) if song_file else None
+            # MPD's own status field -- exactly true while update_database's
+            # scan job is running, no polling/timing guesswork needed (see
+            # the debounce check in _dispatch_button, which reads the same
+            # field before allowing a new scan to start).
+            state.scanning = bool(mstat.get("updating_db"))
+            # Real spectrum data (see audio_visualizer.py). Only sourced in
+            # music mode, matching render.py's draw-gate
+            # (`state.mode == "music" and state.title`) -- no cost paid in
+            # video mode beyond this one attribute read, and get_levels()
+            # decays toward silence on its own once MPD stops writing to
+            # the fifo (paused/stopped), so no extra "is it playing" check
+            # is needed here.
+            state.visualizer_bars = self._visualizer.get_levels()
 
         return state
 

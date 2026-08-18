@@ -259,6 +259,12 @@ class TouchConfig:
     # video/karaoke playback (video mode) simply replaces it via the normal
     # load_and_play path, same as switching between two real videos.
     idle_clip_path: str = "/opt/rpi-player/assets/idle-black.mp4"
+    # Read-only tap for the audio-reactive visualizer (music mode only) —
+    # must match system/mpd.conf's "Visualizer" fifo audio_output's path=
+    # exactly, or AudioVisualizer just retries opening it forever and the
+    # touch UI quietly shows no visualizer (see audio_visualizer.py's
+    # module docstring for why that's a safe degrade, not a crash).
+    visualizer_fifo_path: str = "/run/mpd/visualizer.fifo"
 
 
 @dataclass(frozen=True)

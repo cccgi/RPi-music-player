@@ -31,5 +31,14 @@ Pillow==10.4.0
 # is simply never enabled there.
 evdev==1.7.1
 
+# --- Touch UI audio-reactive visualizer (rpi-touch profile only) -----------
+# FFT over a small rolling window read from MPD's fifo-output tap (see
+# player/audio_visualizer.py's module docstring) — the standard low-cost
+# way to get spectrum data out of MPD without decoding audio a second time
+# or adding a second playback pipeline. Optional at runtime: if this isn't
+# installed, AudioVisualizer.is_available is False and the touch UI simply
+# shows no visualizer instead of failing to start (see that module).
+numpy==2.1.3
+
 # NOTE: TOML parsing uses the stdlib `tomllib` (Python 3.11+). Debian Trixie
 # ships Python 3.13, so no external TOML dependency is needed.
