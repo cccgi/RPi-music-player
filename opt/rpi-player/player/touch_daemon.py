@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import select
 import signal
@@ -89,15 +90,15 @@ _DRAG_RENDER_INTERVAL = 0.05
 # behavior that actually matters here, not the transition style.
 _AUTO_HIDE_DELAY = 2.0
 
-# Swipe-to-hide: a touch that starts AND ends in the open content area
-# (CONTENT_AREA — not on a specific control) counts as a swipe, not a tap,
-# if it covers enough distance quickly enough. A swipe starting on a real
-# control (e.g. dragging off the play button) is deliberately NOT treated
-# as a hide gesture, so it can't be triggered by accident while operating
-# a control. Thresholds are reasonable first-pass defaults; tune from real
-# hardware if taps misfire as swipes or vice versa.
-_SWIPE_MIN_DISTANCE = 60   # logical pixels
-_SWIPE_MAX_DURATION = 0.6  # seconds
+# Content-area gestures: a touch that starts in the open content area (not
+# on a specific control) is a plain tap (toggles overlay visibility) until
+# it moves more than this many logical pixels, at which point it locks into
+# either a "seek" (dominant horizontal movement) or "volume" (dominant
+# vertical movement) gesture for the rest of that touch — see
+# _handle_content_gesture(). The deadzone exists purely so an ordinary tap
+# with a little natural finger wobble doesn't misfire as a 1%-volume-change
+# swipe.
+_GESTURE_DEADZONE = 14  # logical pixels
 
 
 def find_touch_device(explicit_path: str = "") -> "evdev.InputDevice | None":
@@ -209,8 +210,8 @@ class TouchDaemon:
         self._overlay_error_logged = False
         self._overlay_confirmed = False
 
-        # Auto-hide/swipe state — see _AUTO_HIDE_DELAY/_SWIPE_MIN_DISTANCE
-        # module constants and _apply_auto_hide()'s docstring.
+        # Auto-hide state — see _AUTO_HIDE_DELAY module constant and
+        # _apply_auto_hide()'s docstring.
         self._overlay_auto_hide_at: float | None = None
         self._was_playing_video = False
 
@@ -224,6 +225,9 @@ class TouchDaemon:
         self._y = 0
         self._mt_x: int | None = None
         self._mt_y = None
+        # Content-area gesture lock ("seek" | "volume" | None) — see
+        # _GESTURE_DEADZONE and _handle_content_gesture().
+        self._gesture: str | None = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -336,6 +340,7 @@ class TouchDaemon:
         self._down = True
         self._down_x, self._down_y = self._x, self._y
         self._down_at = time.monotonic()
+        self._gesture = None
         mode = _mode.read_mode(self._mode_file)
         self._down_button = layout.hit_test(self._x, self._y, mode)
         LOG.debug("touch down at (%d, %d) -> %s", self._x, self._y,
@@ -353,6 +358,8 @@ class TouchDaemon:
             now = time.monotonic()
             if now - self._last_render_at >= _DRAG_RENDER_INTERVAL:
                 self._apply_drag(self._down_button)
+        elif self._down_button is layout.CONTENT_AREA:
+            self._handle_content_gesture()
 
     def _on_touch_up(self) -> None:
         if not self._down:
@@ -360,14 +367,19 @@ class TouchDaemon:
         self._down = False
         button = self._down_button
         self._down_button = None
+        gesture = self._gesture
+        self._gesture = None
         if button is None:
             return
 
-        # If the overlay is currently hidden (auto-hidden or swiped away),
-        # ANY tap/gesture just brings it back — swallow it rather than also
-        # dispatching whatever button happens to sit at that screen
+        # If the overlay is currently hidden (auto-hidden or manually
+        # hidden), ANY touch just brings it back — swallow it rather than
+        # also dispatching whatever button happens to sit at that screen
         # location, since the user couldn't see a control was even there.
-        # Per explicit request: "Any tap will bring UI back instantly."
+        # Per explicit request: "Any tap will bring UI back instantly." A
+        # content-area gesture (seek/volume) already took effect live
+        # during the drag itself (see _handle_content_gesture) even while
+        # hidden, so this is just revealing the result, not re-applying it.
         if not self._overlay_visible:
             LOG.info("touch while overlay hidden -> restoring overlay")
             self._overlay_visible = True
@@ -382,22 +394,17 @@ class TouchDaemon:
             self._apply_drag(button)
             return
 
-        # Swipe-to-hide: a fast, large-displacement touch that started AND
-        # ends in the open content area (not on a real control) hides the
-        # overlay for full-screen playback. Checked before the tap-target
-        # logic below since a swipe never lands back on a specific button.
         if button is layout.CONTENT_AREA:
-            dx = self._x - self._down_x
-            dy = self._y - self._down_y
-            distance = (dx * dx + dy * dy) ** 0.5
-            elapsed = time.monotonic() - self._down_at
-            if distance >= _SWIPE_MIN_DISTANCE and elapsed <= _SWIPE_MAX_DURATION:
-                LOG.info("swipe detected (%.0fpx in %.2fs) -> hiding overlay",
-                          distance, elapsed)
-                self._overlay_visible = False
-                self._overlay_auto_hide_at = None
-                self._render_and_push(force=True)
+            if gesture is not None:
+                # A seek/volume swipe just finished — already applied live
+                # in _handle_content_gesture, nothing left to do (and
+                # definitely don't also toggle the overlay, which a plain
+                # content-area tap does below).
                 return
+            LOG.info("touch tap -> %s", button.action)
+            self._dispatch_button(button, _mode.read_mode(self._mode_file))
+            self._render_and_push(force=True)
+            return
 
         # Tap-style buttons only fire if release is still over the SAME
         # button that was pressed — avoids firing e.g. Delete because a
@@ -415,6 +422,11 @@ class TouchDaemon:
         self._render_and_push(force=True)
 
     def _apply_drag(self, button: layout.Button) -> None:
+        """Absolute-position drag on a dedicated bar (SCRUB_BAR or
+        VOLUME_BAR — the v2 mockup brought a real volume bar back
+        alongside the swipe-anywhere content gesture, which still works
+        too; they're independent, not mutually exclusive).
+        """
         rect = button.rect
         fraction = (self._x - rect[0]) / max(1, rect[2])
         fraction = max(0.0, min(1.0, fraction))
@@ -437,6 +449,58 @@ class TouchDaemon:
                     self._ctx.video_last_set_volume = volume
                 except Exception:  # noqa: BLE001
                     LOG.debug("video set_volume failed", exc_info=True)
+            else:
+                self._mpd.set_volume(volume)
+
+        self._render_and_push()
+
+    def _handle_content_gesture(self) -> None:
+        """Live seek/volume while dragging anywhere in the open content
+        area (not on a specific control) — the swipe gestures requested to
+        replace the old dedicated bottom volume bar. Direction locks in on
+        whichever axis moves first past _GESTURE_DEADZONE: horizontal ->
+        scrub (mirrors SCRUB_BAR's own absolute-position drag, just not
+        confined to that thin strip), vertical -> volume (top of the
+        content area = 100%, bottom = 0%, matching every phone/media-player
+        swipe-for-volume convention). Applies continuously as the finger
+        moves, same throttling as the scrub-bar/old-volume-bar drags did.
+        """
+        dx = self._x - self._down_x
+        dy = self._y - self._down_y
+        if self._gesture is None:
+            if abs(dx) < _GESTURE_DEADZONE and abs(dy) < _GESTURE_DEADZONE:
+                return  # could still just be a plain tap — don't lock yet
+            self._gesture = "seek" if abs(dx) >= abs(dy) else "volume"
+            LOG.info("content gesture locked: %s", self._gesture)
+
+        now = time.monotonic()
+        if now - self._last_render_at < _DRAG_RENDER_INTERVAL:
+            return
+
+        area = layout.CONTENT_AREA.rect
+        mode = _mode.read_mode(self._mode_file)
+
+        if self._gesture == "seek":
+            fraction = (self._x - area[0]) / max(1, area[2])
+            fraction = max(0.0, min(1.0, fraction))
+            if mode == "video" and self._video is not None:
+                try:
+                    duration = self._video.status().get("duration", 0.0)
+                    self._video.seek_absolute(fraction * duration)
+                except Exception:  # noqa: BLE001 - mpv may be idle/unreachable
+                    LOG.debug("video seek_absolute (gesture) failed", exc_info=True)
+            else:
+                self._mpd.seek_absolute(fraction)
+        else:  # "volume"
+            fraction = 1.0 - (self._y - area[1]) / max(1, area[3])
+            fraction = max(0.0, min(1.0, fraction))
+            volume = int(round(fraction * 100))
+            if mode == "video" and self._video is not None:
+                try:
+                    self._video.set_volume(volume)
+                    self._ctx.video_last_set_volume = volume
+                except Exception:  # noqa: BLE001
+                    LOG.debug("video set_volume (gesture) failed", exc_info=True)
             else:
                 self._mpd.set_volume(volume)
 
@@ -541,6 +605,16 @@ class TouchDaemon:
             except Exception:  # noqa: BLE001 - mpv may be idle/unreachable
                 state.vocal_active = True
             state.storage = "USB" if video_storage_label() == "USB" else "INT"
+            # "curate_current"/"video_curate_current" (actions.py) don't
+            # toggle a flag anywhere — they physically MOVE the file into a
+            # "Curated/" subfolder next to itself. There's no separate
+            # curated bit to query, but that move IS observable: if the
+            # currently loaded file's own path already runs through a
+            # "Curated" directory, it's already been curated. Cheap, exact,
+            # and needs no new state to keep in sync with the real action.
+            media_path = vstat.get("path", "")
+            state.curated = bool(media_path) and "Curated" in Path(media_path).parts
+            state.tags = self._video_format_tags()
         else:
             mstat = self._mpd.status()
             song = self._mpd.current_song()
@@ -554,8 +628,48 @@ class TouchDaemon:
                 pass
             state.playing = mstat.get("state") == "play"
             state.storage = "USB" if music_storage_label() == "USB" else "INT"
+            song_file = song.get("file", "")
+            state.curated = bool(song_file) and "Curated" in Path(song_file).parts
+            state.meta_line = _album_meta_line(song)
+            state.tags = _music_format_tags(song_file, mstat.get("audio", ""))
 
         return state
+
+    def _video_format_tags(self) -> list[str]:
+        """Resolution/codec/aspect/fps chips for the header — mirrors the
+        mockup's "1920x1080 | H.264 | 16:9 | 29.97 fps" row. Queried live
+        from mpv rather than cached anywhere; best-effort, since none of
+        this is essential to playback (missing properties just produce
+        fewer chips, never an error).
+        """
+        if self._video is None:
+            return []
+        try:
+            w = self._video.get("video-params/w") or self._video.get("width")
+            h = self._video.get("video-params/h") or self._video.get("height")
+            codec = self._video.get("video-codec", "") or ""
+            fps = self._video.get("container-fps") or self._video.get("estimated-vf-fps")
+        except Exception:  # noqa: BLE001 - mpv may be idle/unreachable
+            return []
+        tags = []
+        if w and h:
+            try:
+                tags.append(f"{int(w)}x{int(h)}")
+            except (TypeError, ValueError):
+                pass
+        if codec:
+            tags.append(_short_codec(str(codec)))
+        if w and h:
+            try:
+                tags.append(_aspect_ratio(int(w), int(h)))
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        if fps:
+            try:
+                tags.append(f"{float(fps):.2f} fps")
+            except (TypeError, ValueError):
+                pass
+        return tags
 
     def _apply_auto_hide(self, state: OverlayState) -> None:
         """Video-mode auto-hide: 2s after playback starts (or resumes from
@@ -632,6 +746,75 @@ class TouchDaemon:
                 self._overlay_confirmed = True
         except Exception:  # noqa: BLE001 - mpv may not be up yet; retried next tick
             LOG.debug("overlay push failed (mpv not reachable?)", exc_info=True)
+
+
+# -- format-tag / meta-line helpers (module-level: no daemon state needed) ---
+
+def _album_meta_line(song: dict) -> str:
+    """"Album (Year)" line under the artist, music mode only — matches the
+    mockup's "A Night At The Opera (1975)". Degrades gracefully: album
+    only, year only, or neither (empty string, meaning render.py just
+    skips that line).
+    """
+    album = song.get("album", "")
+    date = song.get("date", "")
+    year = date[:4] if date else ""
+    if album and year:
+        return f"{album} ({year})"
+    return album or year
+
+
+def _music_format_tags(song_file: str, audio_field: str) -> list[str]:
+    """FLAC/24-bit/96 kHz/2ch chips — matches the mockup's format row.
+    ``audio_field`` is MPD status()'s ``audio`` value, "samplerate:bits:
+    channels" (e.g. "96000:24:2"), present only while actually playing.
+    """
+    tags = []
+    ext = Path(song_file).suffix.lstrip(".").upper()
+    if ext:
+        tags.append(ext)
+    parts = audio_field.split(":") if audio_field else []
+    if len(parts) == 3:
+        rate_str, bits, chans = parts
+        try:
+            rate_khz = int(rate_str) / 1000
+            tags.append(f"{bits}-bit")
+            tags.append(f"{rate_khz:g} kHz")
+            tags.append(f"{chans}ch")
+        except ValueError:
+            pass
+    return tags
+
+
+# mpv's video-codec property returns short internal codec names, not the
+# marketing-friendly labels the mockup uses — map the common ones, fall
+# back to just upper-casing whatever mpv reported for anything else.
+_CODEC_LABELS = {
+    "h264": "H.264", "avc": "H.264", "hevc": "HEVC", "h265": "HEVC",
+    "vp9": "VP9", "vp8": "VP8", "av1": "AV1", "mpeg4": "MPEG-4",
+    "mpeg2video": "MPEG-2", "theora": "Theora",
+}
+
+
+def _short_codec(codec: str) -> str:
+    key = codec.strip().lower()
+    return _CODEC_LABELS.get(key, codec.upper())
+
+
+def _aspect_ratio(w: int, h: int) -> str:
+    """Reduce w:h to a small integer ratio, snapping to the common
+    16:9/4:3/21:9 video ratios within a small tolerance so 1920x1080 reads
+    as "16:9" rather than a technically-correct but unfamiliar "16:9"-ish
+    fraction from rounding (e.g. some encodes are 1920x1078).
+    """
+    if h <= 0:
+        return ""
+    ratio = w / h
+    for label, target in (("16:9", 16 / 9), ("4:3", 4 / 3), ("21:9", 21 / 9), ("1:1", 1.0)):
+        if abs(ratio - target) < 0.02:
+            return label
+    g = math.gcd(w, h)
+    return f"{w // g}:{h // g}" if g else f"{w}:{h}"
 
 
 def main(argv: list[str] | None = None) -> int:

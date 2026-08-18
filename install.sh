@@ -389,16 +389,36 @@ mkdir -p "$MUSIC_DIR"
 chown "$SERVICE_USER:$SERVICE_USER" "$MUSIC_DIR"
 chmod 0775 "$MUSIC_DIR"
 
+# Video/karaoke library — created here (not just in the later "Creating
+# video/karaoke library" step, which still runs and is a harmless no-op
+# mkdir -p) because the Samba share needs the directory to exist by the
+# time smb.conf is written and testparm validates it below. Matches
+# config.toml's [video] library_dir default.
+VIDEO_DIR="/home/$SERVICE_USER/Video"
+mkdir -p "$VIDEO_DIR"
+chown "$SERVICE_USER:$SERVICE_USER" "$VIDEO_DIR"
+chmod 0775 "$VIDEO_DIR"
+
 if [[ -f /etc/samba/smb.conf && ! -f /etc/samba/smb.conf.orig ]]; then
     cp /etc/samba/smb.conf /etc/samba/smb.conf.orig
     log "Backed up original smb.conf to smb.conf.orig"
 fi
-sed "s|/home/pi/Music|$MUSIC_DIR|g; s|valid users = pi|valid users = $SERVICE_USER|; \
-     s|force user = pi|force user = $SERVICE_USER|; s|force group = pi|force group = $SERVICE_USER|" \
+sed "s|/home/pi/Music|$MUSIC_DIR|g; s|/home/pi/Video|$VIDEO_DIR|g; \
+     s|valid users = pi|valid users = $SERVICE_USER|g; \
+     s|force user = pi|force user = $SERVICE_USER|g; s|force group = pi|force group = $SERVICE_USER|g" \
     "$SRC/system/samba/smb.conf" > /etc/samba/smb.conf
 
 mkdir -p /etc/avahi/services
 install -m 0644 "$SRC/system/samba/avahi-smb.service" /etc/avahi/services/smb.service
+
+# smbpasswd is per-user and NOT set by this script (needs an interactive
+# password prompt) — see the "Video/karaoke mode" note near the end of this
+# script's summary output for the exact command to run once, by hand.
+if ! (sudo -u "$SERVICE_USER" true 2>/dev/null; pdbedit -L 2>/dev/null | grep -q "^$SERVICE_USER:"); then
+    warn "no Samba password set for $SERVICE_USER yet — the Music/Video shares"
+    warn "  will prompt for credentials and reject them until you run:"
+    warn "    sudo smbpasswd -a $SERVICE_USER"
+fi
 
 testparm -s >/dev/null 2>&1 || warn "testparm reported problems with smb.conf"
 

@@ -2,18 +2,43 @@
 composites over whatever it's currently showing (idle/black in music mode,
 a real frame in video mode) via IPC ``overlay-add``.
 
-Mirrors player/streamdeck/render.py's approach (Pillow, config.toml's
-[streamdeck.theme] colors, DejaVu fonts install.sh guarantees) rather than
-inventing a second visual language for the same project.
+--------------------------------------------------------------------------
+v2 redesign
+--------------------------------------------------------------------------
+The first pass here was a pure outline wireframe (fully transparent
+interiors, no fills at all). That was explicitly rejected as "hideous" in
+favor of a supplied mockup: filled rounded pill buttons with colored
+borders, a soft glow on the Play button, an album-art panel with a heart
+badge, and format-tag chips (FLAC/24-bit/96kHz, or resolution/codec/fps).
+This file was rewritten to match that mockup's visual language.
+
+One deliberate compromise versus the mockup, kept from the original,
+still-valid request ("I need this UI to be wireframe... so I can see
+through the video being played"): every panel/pill fill here is
+TRANSLUCENT (low alpha), not fully opaque like the mockup's dark cards.
+In music mode there's nothing playing behind the UI to see through
+anyway (mpv just holds an idle black clip), so this barely matters there
+— but in video/karaoke mode the actual video is still playing full-screen
+underneath, and a fully opaque card would silently defeat the whole
+reason this got built as an mpv overlay instead of a normal touchscreen
+UI toolkit. Translucent fills keep the mockup's polished look while
+keeping that promise.
+
+No real album art or video-frame thumbnail is fetched here (that needs an
+MPD `albumart`/`readpicture` binary-protocol fetch — or an ffmpeg frame
+grab for video — with its own caching; scoped out of this pass, flagged
+as a natural follow-up). The art panel instead shows a themed placeholder
+icon (music note / film reel).
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from . import layout
 
@@ -25,12 +50,15 @@ _FALLBACK_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 @dataclass
 class Theme:
-    bg: str = "#101014"
+    bg: str = "#0A0E16"
+    panel: str = "#12161F"
     fg: str = "#F2F2F7"
-    muted: str = "#8E8E93"
-    accent: str = "#0A84FF"
-    active: str = "#30D158"
+    muted: str = "#8E8E99"
+    accent: str = "#3D8BFD"       # music mode accent (blue)
+    accent_video: str = "#A855F7"  # video mode accent (purple)
+    active: str = "#22C58B"       # connected/active route (green)
     warn: str = "#FF9F0A"
+    favorite: str = "#FF5C7A"
     font_regular: str = _FALLBACK_REGULAR
     font_bold: str = _FALLBACK_BOLD
 
@@ -40,6 +68,8 @@ class OverlayState:
     mode: str = "music"                 # "music" | "video"
     title: str = ""
     artist: str = ""                    # or a fixed sub-label in video mode
+    meta_line: str = ""                 # music: "Album (Year)"; video: unused
+    tags: list = field(default_factory=list)  # format chips, e.g. ["FLAC", "24-bit", "96 kHz", "2ch"]
     elapsed: float = 0.0
     duration: float = 0.0
     volume: int = 0
@@ -63,12 +93,12 @@ class Renderer:
 
     def __init__(self, theme: Theme) -> None:
         self._theme = theme
-        self._font_title = self._load(theme.font_bold, 20)
-        self._font_sub = self._load(theme.font_regular, 14)
+        self._font_title = self._load(theme.font_bold, 25)
+        self._font_sub = self._load(theme.font_regular, 16)
+        self._font_meta = self._load(theme.font_regular, 13)
         self._font_pill = self._load(theme.font_bold, 15)
+        self._font_tag = self._load(theme.font_bold, 12)
         self._font_time = self._load(theme.font_regular, 13)
-        self._font_icon = self._load(theme.font_bold, 20)
-        self._font_big = self._load(theme.font_regular, 26)
 
     def _load(self, path: str, size: int) -> ImageFont.FreeTypeFont:
         for candidate in (path, _FALLBACK_REGULAR):
@@ -86,9 +116,13 @@ class Renderer:
         """Return raw BGRA bytes, W*H*4, ready for mpv's overlay-add."""
         img = Image.new("RGBA", (layout.W, layout.H), (0, 0, 0, 0))
         if state.overlay_visible:
+            accent = self._theme.accent_video if state.mode == "video" else self._theme.accent
             draw = ImageDraw.Draw(img)
-            self._draw_topbar(draw, state)
-            self._draw_bottombar(draw, state)
+            self._draw_art_panel(img, draw, state, accent)
+            self._draw_header(draw, state, accent)
+            self._draw_scrub(draw, state, accent)
+            self._draw_transport(img, draw, state, accent)
+            self._draw_volume(draw, state)
         if rotate_180:
             img = img.transpose(Image.ROTATE_180)
         # mpv's overlay-add "bgra" format wants byte order B,G,R,A per
@@ -96,224 +130,357 @@ class Renderer:
         # without a manual channel-swap loop.
         return img.tobytes("raw", "BGRA")
 
-    # -- top bar ---------------------------------------------------------------
-    #
-    # Everything below is deliberately drawn as OUTLINE-ONLY shapes with a
-    # transparent interior — no filled bars, pills, or button backgrounds —
-    # so the video/art playing underneath stays visible through the whole
-    # control surface, not just in the gaps between controls. "Active" state
-    # (current mode, current route, playing, curated, vocal/karaoke) is
-    # conveyed by a brighter/colored OUTLINE and text color, never a filled
-    # block. Requested explicitly after the first working render looked too
-    # much like a solid HUD panel sitting on top of the video.
+    # -- shared drawing helpers ------------------------------------------------
 
-    def _pill(self, draw: ImageDraw.ImageDraw, rect, text, font, fg, active=False,
-               accent=None):
-        t = self._theme
-        x, y, w, h = rect
-        outline = _hex_rgba(accent or t.accent) if active else _hex_rgba(t.fg, 140)
-        draw.rounded_rectangle([x, y, x + w, y + h], radius=h // 2, outline=outline, width=2)
-        tw = draw.textlength(text, font=font)
-        draw.text((x + (w - tw) / 2, y + h / 2), text, font=font, fill=fg, anchor="lm")
-
-    def _draw_topbar(self, draw: ImageDraw.ImageDraw, state: OverlayState) -> None:
-        t = self._theme
-
-        mode_label = "MUSIC" if state.mode == "music" else "VIDEO"
-        self._pill(draw, MODE_RECT, mode_label, self._font_pill, _hex_rgba(t.fg), active=True)
-
-        # now playing strip — text only, no backing panel. A thin drop
-        # shadow (offset dark copy under the light text) keeps it legible
-        # over bright video content without needing an opaque strip.
-        title = state.title or ("Nothing playing" if state.mode == "music" else "No video loaded")
-        self._shadowed_text(draw, (136, 14), title, self._font_title, _hex_rgba(t.fg))
-        if state.artist:
-            self._shadowed_text(draw, (136, 36), state.artist, self._font_sub, _hex_rgba(t.fg, 220))
-
-        # storage pill
-        self._pill(draw, STORAGE_RECT, state.storage, self._font_pill, _hex_rgba(t.fg))
-
-        # route icons — drawn as text abbreviations, not emoji/dingbats.
-        # DejaVu (what install.sh guarantees on the Pi) does not reliably
-        # cover the Bluetooth/AirPlay/media-control Unicode blocks — found
-        # live in a local render preview: those glyphs came back as blank
-        # tofu boxes even though plain ASCII and ♡/♥ (Latin-1 range)
-        # rendered fine. Every icon in this file is vector-drawn or plain
-        # text for exactly that reason — no font-coverage gamble anywhere.
-        self._route_icon(draw, BT_RECT, "BT", state.bt_available,
-                          state.route_icon == "bluetooth")
-        self._route_icon(draw, AIRPLAY_RECT, "AP", state.airplay_available,
-                          state.route_icon == "airplay")
+    def _glow(self, img: Image.Image, cx: float, cy: float, r: float, color: tuple, blur: int = 12) -> None:
+        """Soft blurred halo behind an element — the one place a real
+        Gaussian blur is worth the per-frame cost, since it's what makes
+        the Play button read as "glowing" like the mockup instead of just
+        outlined. Composited onto ``img`` directly, so call this BEFORE
+        drawing the crisp shape on top of it.
+        """
+        layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        ImageDraw.Draw(layer).ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
+        layer = layer.filter(ImageFilter.GaussianBlur(blur))
+        img.alpha_composite(layer)
 
     def _shadowed_text(self, draw, pos, text, font, fill):
         x, y = pos
-        draw.text((x + 1, y + 1), text, font=font, fill=(0, 0, 0, 160))
+        draw.text((x + 1, y + 1), text, font=font, fill=(0, 0, 0, 170))
         draw.text((x, y), text, font=font, fill=fill)
 
-    def _route_icon(self, draw, rect, label, available, is_active):
-        t = self._theme
-        x, y, w, h = rect
-        if is_active:
-            outline, fg = _hex_rgba(t.active), _hex_rgba(t.active)
-        elif available:
-            outline, fg = _hex_rgba(t.fg, 140), _hex_rgba(t.fg)
-        else:
-            outline, fg = _hex_rgba(t.muted, 90), _hex_rgba(t.muted, 140)
-        draw.ellipse([x, y, x + w, y + h], outline=outline, width=2)
-        tw = draw.textlength(label, font=self._font_time)
-        draw.text((x + w / 2 - tw / 2, y + h / 2), label, font=self._font_time, fill=fg, anchor="lm")
-
-    # -- bottom bar --------------------------------------------------------------
-
-    def _draw_bottombar(self, draw: ImageDraw.ImageDraw, state: OverlayState) -> None:
-        t = self._theme
-
-        # scrub bar — a thin outline track (not a filled block) with a
-        # solid PROGRESS line inside it. The progress line is intentionally
-        # still a thin fill (a few px tall, not a panel) since a track with
-        # no visible fill at all gives no sense of playback position.
-        sx, sy, sw, sh = layout.SCRUB_BAR.rect
-        draw.rounded_rectangle([sx, sy + sh // 2 - 2, sx + sw, sy + sh // 2 + 3],
-                                radius=3, outline=_hex_rgba(t.fg, 140), width=1)
-        frac = 0.0
-        if state.duration > 0:
-            frac = max(0.0, min(1.0, state.elapsed / state.duration))
-        fill_w = int(sw * frac)
-        if fill_w > 2:
-            draw.rounded_rectangle([sx, sy + sh // 2 - 2, sx + fill_w, sy + sh // 2 + 3],
-                                    radius=3, fill=_hex_rgba(t.accent))
-        draw.ellipse([sx + fill_w - 6, sy + sh // 2 - 6, sx + fill_w + 6, sy + sh // 2 + 6],
-                     outline=_hex_rgba(t.fg), width=2)
-        self._shadowed_text(draw, (sx, sy - 16), _fmt_time(state.elapsed), self._font_time,
-                             _hex_rgba(t.fg, 220))
-        dur_txt = _fmt_time(state.duration)
-        dw = draw.textlength(dur_txt, font=self._font_time)
-        self._shadowed_text(draw, (sx + sw - dw, sy - 16), dur_txt, self._font_time,
-                             _hex_rgba(t.fg, 220))
-
-        buttons = layout.buttons_for_mode(state.mode)
-        by_action = {b.action: b for b in buttons}
-
-        curate = by_action.get("curate_current") or by_action.get("video_curate_current")
-        prev_b = by_action.get("prev_track") or by_action.get("video_prev_song")
-        play_b = by_action.get("toggle_pause") or by_action.get("video_play_pause")
-        next_b = by_action.get("next_track") or by_action.get("video_next_song")
-        delete_b = by_action.get("delete_current") or by_action.get("video_delete_current")
-
-        if curate:
-            self._round_btn(draw, curate.rect, glyph="curate", curated=state.curated,
-                             accent_color="#FF6482" if state.curated else None)
-        if prev_b:
-            self._round_btn(draw, prev_b.rect, glyph="prev")
-        if play_b:
-            self._round_btn(draw, play_b.rect, glyph="pause" if state.playing else "play",
-                             accent_color=t.accent if state.playing else None, big=True)
-        if next_b:
-            self._round_btn(draw, next_b.rect, glyph="next")
-        if delete_b:
-            self._round_btn(draw, delete_b.rect, glyph="delete", accent_hover=t.warn)
-
-        if state.mode == "video":
-            vb = layout.VOCAL_BTN.rect
-            label = "VOCAL" if state.vocal_active else "KARAOKE"
-            self._pill(draw, vb, label, self._font_pill, _hex_rgba(t.fg),
-                       active=state.vocal_active)
-
-        # volume row — "VOL" text label instead of a speaker glyph (see the
-        # font-coverage note in _draw_topbar; same policy applies here). The
-        # track is an outline only; the fill is a thin progress line, same
-        # treatment as the scrub bar above.
-        vx, vy, vw, vh = layout.VOLUME_BAR.rect
-        self._shadowed_text(draw, (vx - 30, vy + vh / 2 - 6), "VOL", self._font_time,
-                             _hex_rgba(t.fg, 220))
-        draw.rounded_rectangle([vx, vy + vh // 2 - 2, vx + vw, vy + vh // 2 + 3],
-                                radius=3, outline=_hex_rgba(t.fg, 140), width=1)
-        vfrac = max(0.0, min(1.0, state.volume / 100.0))
-        vfill = int(vw * vfrac)
-        if vfill > 2:
-            draw.rounded_rectangle([vx, vy + vh // 2 - 2, vx + vfill, vy + vh // 2 + 3],
-                                    radius=3, fill=_hex_rgba(t.fg, 220))
-        draw.ellipse([vx + vfill - 6, vy + vh // 2 - 6, vx + vfill + 6, vy + vh // 2 + 6],
-                     outline=_hex_rgba(t.fg), width=2)
-        pct = f"{state.volume}%"
-        self._shadowed_text(draw, (vx + vw + 8, vy + vh / 2 - 6), pct, self._font_time,
-                             _hex_rgba(t.fg, 220))
-
-    def _round_btn(self, draw, rect, glyph, accent_color=None, accent_hover=None, big=False,
-                    curated=False):
-        """Draw a round transport button as an OUTLINE with a VECTOR-drawn
-        glyph — no filled background, so video shows through the whole
-        button, not just around it.
-
-        No text/emoji glyph is used for the icon itself — see the
-        font-coverage note in _draw_topbar. Play/pause/prev/next/delete/
-        curate are all drawn as simple outlined polygons/lines instead,
-        which render identically regardless of what's installed on the Pi.
-        ``accent_color`` tints the outline+icon for an "active" state (e.g.
-        playing, curated) instead of filling the button — that's the
-        wireframe look requested after the first working render looked too
-        much like a solid HUD panel. ``accent_hover`` is a softer per-button
-        tint (e.g. delete's warn color) applied even when not "active".
+    def _pill_button(self, draw, rect, icon_fn, text, active=False, accent=None,
+                      muted=False) -> None:
+        """A filled, rounded pill: translucent background + colored border
+        when active/accented, icon on the left, label text after it. This
+        is the workhorse shape for every transport/route control in the
+        v2 design — see this module's docstring for why the fill stays
+        translucent rather than fully opaque like the mockup.
         """
         t = self._theme
         x, y, w, h = rect
-        color = accent_color or accent_hover or t.fg
-        fg = _hex_rgba(color) if isinstance(color, str) else color
-        width = 3 if accent_color else 2
-        draw.rounded_rectangle([x, y, x + w, y + h], radius=w // 3, outline=fg, width=width)
+        color = accent or t.fg
+        if muted:
+            border = _hex_rgba(t.muted, 90)
+            fill = _hex_rgba(t.muted, 22)
+            fg = _hex_rgba(t.muted, 180)
+        elif active:
+            border = _hex_rgba(color, 235)
+            fill = _hex_rgba(color, 60)
+            fg = _hex_rgba(t.fg)
+        else:
+            border = _hex_rgba(t.fg, 90)
+            fill = _hex_rgba(t.fg, 20)
+            fg = _hex_rgba(t.fg, 220)
+        draw.rounded_rectangle([x, y, x + w, y + h], radius=h / 2, outline=border, width=2, fill=fill)
 
+        cy = y + h / 2
+        icon_s = h * 0.28
+        pad = h * 0.32
+        if icon_fn is not None:
+            icon_cx = x + pad + icon_s * 0.5
+            icon_fn(draw, icon_cx, cy, icon_s, fg)
+            text_x = icon_cx + icon_s * 1.15
+        else:
+            text_x = x + pad
+        if text:
+            draw.text((text_x, cy), text, font=self._font_pill, fill=fg, anchor="lm")
+
+    # -- album art panel ---------------------------------------------------------
+
+    def _draw_art_panel(self, img, draw, state: OverlayState, accent: str) -> None:
+        """No real album art / video thumbnail fetch yet (see module
+        docstring) — a themed rounded panel with a music-note or film-reel
+        icon stands in for it, plus the heart badge the mockup overlays on
+        the art's corner (also a real, tappable curate button — see
+        layout.ART_BADGE).
+        """
+        t = self._theme
+        x, y, w, h = layout.ART_RECT
+        draw.rounded_rectangle([x, y, x + w, y + h], radius=18,
+                                fill=_hex_rgba(t.panel, 210), outline=_hex_rgba(accent, 140), width=2)
         cx, cy = x + w / 2, y + h / 2
-        s = (h * (0.42 if big else 0.34))  # icon half-size, scales with button
+        if state.mode == "video":
+            _icon_film(draw, cx, cy, w * 0.22, _hex_rgba(accent, 200))
+        else:
+            _icon_music_note(draw, cx, cy, w * 0.22, _hex_rgba(accent, 200))
 
-        if glyph == "play":
-            draw.polygon([(cx - s * 0.6, cy - s), (cx - s * 0.6, cy + s), (cx + s, cy)],
-                         outline=fg, width=2)
-        elif glyph == "pause":
-            bar_w = s * 0.45
-            draw.rectangle([cx - s * 0.8, cy - s, cx - s * 0.8 + bar_w, cy + s],
-                           outline=fg, width=2)
-            draw.rectangle([cx + s * 0.35, cy - s, cx + s * 0.35 + bar_w, cy + s],
-                           outline=fg, width=2)
-        elif glyph == "prev":
-            draw.polygon([(cx + s * 0.5, cy - s), (cx + s * 0.5, cy + s), (cx - s * 0.3, cy)],
-                         outline=fg, width=2)
-            draw.line([(cx - s, cy - s), (cx - s, cy + s)], fill=fg, width=2)
-        elif glyph == "next":
-            draw.polygon([(cx - s * 0.5, cy - s), (cx - s * 0.5, cy + s), (cx + s * 0.3, cy)],
-                         outline=fg, width=2)
-            draw.line([(cx + s, cy - s), (cx + s, cy + s)], fill=fg, width=2)
-        elif glyph == "delete":
-            # simple trash-can: lid line + body rectangle outline
-            body_w, body_h = s * 1.3, s * 1.4
-            bx0, by0 = cx - body_w / 2, cy - body_h / 2 + s * 0.25
-            bx1, by1 = cx + body_w / 2, cy + body_h / 2
-            draw.rectangle([bx0, by0, bx1, by1], outline=fg, width=2)
-            draw.line([(bx0 - 3, by0), (bx1 + 3, by0)], fill=fg, width=2)
-            draw.line([(cx - body_w * 0.2, by0), (cx - body_w * 0.15, by0 - 5)], fill=fg, width=2)
-            draw.line([(cx + body_w * 0.2, by0), (cx + body_w * 0.15, by0 - 5)], fill=fg, width=2)
-        elif glyph == "curate":
-            # heart: two circles + a triangle, filled only when curated —
-            # the one shape that keeps a small solid fill on purpose, since
-            # a "liked" indicator reading as a filled heart is a much
-            # stronger, more universally understood signal than an outline
-            # heart would be, and it is tiny relative to the whole button.
-            r = s * 0.5
-            draw.ellipse([cx - r * 1.5, cy - r * 0.7, cx - r * 0.1, cy + r * 0.9],
-                         outline=fg, width=2, fill=fg if curated else None)
-            draw.ellipse([cx + r * 0.1, cy - r * 0.7, cx + r * 1.5, cy + r * 0.9],
-                         outline=fg, width=2, fill=fg if curated else None)
-            draw.polygon([(cx - r * 1.3, cy + r * 0.3), (cx + r * 1.3, cy + r * 0.3), (cx, cy + r * 1.7)],
-                         outline=fg, width=2, fill=fg if curated else None)
+        # heart badge, top-left corner of the art
+        bx, by, bw, bh = layout.ART_BADGE.rect
+        badge_fill = _hex_rgba(t.favorite, 210) if state.curated else _hex_rgba(t.bg, 190)
+        draw.rounded_rectangle([bx, by, bx + bw, by + bh], radius=9, fill=badge_fill,
+                                outline=_hex_rgba(t.favorite, 220), width=2)
+        _heart_glyph(draw, bx + bw / 2, by + bh / 2, bw * 0.3, _hex_rgba(t.fg), filled=state.curated)
+
+    # -- header: mode/output pills, title, tags --------------------------------
+
+    def _draw_header(self, draw, state: OverlayState, accent: str) -> None:
+        t = self._theme
+
+        mode_icon = _icon_film if state.mode == "video" else _icon_music_note
+        mode_label = "VIDEO" if state.mode == "video" else "MUSIC"
+        self._pill_button(draw, layout.MODE_PILL.rect, mode_icon, mode_label,
+                           active=True, accent=accent)
+
+        buttons = layout.buttons_for_mode(state.mode)
+        by_action = {b.action: b for b in buttons}
+        scan_b = by_action.get("update_database") or by_action.get("video_rescan")
+        if scan_b:
+            sx, sy, sw, sh = scan_b.rect
+            draw.rounded_rectangle([sx, sy, sx + sw, sy + sh], radius=10,
+                                    fill=_hex_rgba(t.fg, 18), outline=_hex_rgba(t.fg, 90), width=2)
+            _scan_glyph(draw, sx + sw / 2, sy + sh / 2, sw * 0.32, _hex_rgba(t.fg, 220))
+
+        self._pill_button(draw, layout.STORAGE_PILL.rect, _icon_drive, state.storage,
+                           active=False)
+        self._pill_button(draw, layout.BT_PILL.rect, _icon_bluetooth, "BT",
+                           active=state.route_icon == "bluetooth", accent=t.active,
+                           muted=not state.bt_available and state.route_icon != "bluetooth")
+        self._pill_button(draw, layout.AIRPLAY_PILL.rect, _icon_airplay, "AP",
+                           active=state.route_icon == "airplay", accent=t.active,
+                           muted=not state.airplay_available and state.route_icon != "airplay")
+
+        title_x = layout.MODE_PILL.rect[0]
+        title = state.title or ("Nothing playing" if state.mode == "music" else "No video loaded")
+        self._shadowed_text(draw, (title_x, 68), title, self._font_title, _hex_rgba(t.fg))
+        if state.artist:
+            self._shadowed_text(draw, (title_x, 102), state.artist, self._font_sub,
+                                 _hex_rgba(t.fg, 210))
+        if state.meta_line:
+            self._shadowed_text(draw, (title_x, 124), state.meta_line, self._font_meta,
+                                 _hex_rgba(t.muted, 220))
+
+        # format-tag chips (FLAC/24-bit/96kHz/2ch, or 1920x1080/H.264/16:9/29.97fps)
+        tx = title_x
+        ty = 150
+        for tag in state.tags:
+            tw = draw.textlength(tag, font=self._font_tag) + 16
+            draw.rounded_rectangle([tx, ty, tx + tw, ty + 22], radius=6,
+                                    fill=_hex_rgba(t.fg, 16), outline=_hex_rgba(t.fg, 80), width=1)
+            draw.text((tx + 8, ty + 11), tag, font=self._font_tag, fill=_hex_rgba(t.fg, 210), anchor="lm")
+            tx += tw + 8
+
+    # -- scrub bar ---------------------------------------------------------------
+
+    def _draw_scrub(self, draw, state: OverlayState, accent: str) -> None:
+        t = self._theme
+        sx, sy, sw, sh = layout.SCRUB_BAR.rect
+        track_y = sy + sh / 2
+        self._shadowed_text(draw, (sx, sy - 20), _fmt_time(state.elapsed), self._font_time,
+                             _hex_rgba(t.fg, 210))
+        dur_txt = _fmt_time(state.duration)
+        dw = draw.textlength(dur_txt, font=self._font_time)
+        self._shadowed_text(draw, (sx + sw - dw, sy - 20), dur_txt, self._font_time,
+                             _hex_rgba(t.fg, 210))
+
+        draw.line([(sx, track_y), (sx + sw, track_y)], fill=_hex_rgba(t.fg, 60), width=4)
+        frac = 0.0
+        if state.duration > 0:
+            frac = max(0.0, min(1.0, state.elapsed / state.duration))
+        fill_x = sx + sw * frac
+        if frac > 0:
+            draw.line([(sx, track_y), (fill_x, track_y)], fill=_hex_rgba(accent, 235), width=4)
+        draw.ellipse([fill_x - 7, track_y - 7, fill_x + 7, track_y + 7],
+                     fill=_hex_rgba(t.fg), outline=_hex_rgba(accent, 235), width=2)
+
+    # -- transport row -------------------------------------------------------------
+
+    def _draw_transport(self, img, draw, state: OverlayState, accent: str) -> None:
+        """NOTE: curate/prev/play/next each have TWO Button entries sharing
+        the same action name (the transport-row pill here, plus ART_BADGE
+        on the album art for curate specifically) — do NOT look these up
+        via a by_action={b.action: b for b in buttons} dict the way the
+        header does for BT/AP/scan. Two rects with the same action collide
+        in that dict (whichever is last in the tuple wins), which is
+        exactly the bug that first shipped here: the transport row's
+        FAVORITE pill silently rendered at the tiny art-badge rect
+        instead. Reference layout.CURATE_BTN[_V] etc. directly instead.
+        """
+        t = self._theme
+        video = state.mode == "video"
+        curate_rect = layout.CURATE_BTN_V.rect if video else layout.CURATE_BTN.rect
+        prev_rect = layout.PREV_BTN_V.rect if video else layout.PREV_BTN.rect
+        play_rect = layout.PLAY_BTN_V.rect if video else layout.PLAY_BTN.rect
+        next_rect = layout.NEXT_BTN_V.rect if video else layout.NEXT_BTN.rect
+
+        self._pill_button(draw, curate_rect,
+                           lambda d, cx, cy, s, fg: _heart_glyph(d, cx, cy, s, fg, filled=state.curated),
+                           "FAVORITE", active=state.curated, accent=t.favorite)
+        self._pill_button(draw, prev_rect,
+                           lambda d, cx, cy, s, fg: _skip_glyph(d, cx, cy, s, fg, direction=-1),
+                           "PREVIOUS")
+        self._pill_button(draw, next_rect,
+                           lambda d, cx, cy, s, fg: _skip_glyph(d, cx, cy, s, fg, direction=1),
+                           "NEXT")
+        if video:
+            vb = layout.VOCAL_BTN.rect
+            label = "VOCAL" if state.vocal_active else "KARAOKE"
+            # No icon here (icon_fn=None) — this pill's rect is narrower
+            # than the others and "KARAOKE" already nearly fills it; adding
+            # a mic icon pushed the text into the pill's rounded edge.
+            self._pill_button(draw, vb, None, label, active=state.vocal_active,
+                               accent=t.accent_video)
+
+        x, y, w, h = play_rect
+        cx, cy = x + w / 2, y + h / 2
+        r = max(w, h) / 2
+        self._glow(img, cx, cy, r * 1.35, _hex_rgba(accent, 110))
+        draw.ellipse([x, y, x + w, y + h], fill=_hex_rgba(accent, 90),
+                     outline=_hex_rgba(accent, 240), width=3)
+        s = h * 0.26
+        if state.playing:
+            bar_w = s * 0.55
+            draw.rounded_rectangle([cx - s * 0.8, cy - s, cx - s * 0.8 + bar_w, cy + s],
+                                    radius=bar_w * 0.3, fill=_hex_rgba(t.fg))
+            draw.rounded_rectangle([cx + s * 0.25, cy - s, cx + s * 0.25 + bar_w, cy + s],
+                                    radius=bar_w * 0.3, fill=_hex_rgba(t.fg))
+        else:
+            draw.polygon([(cx - s * 0.55, cy - s), (cx - s * 0.55, cy + s), (cx + s * 0.95, cy)],
+                         fill=_hex_rgba(t.fg))
+
+    # -- volume row ----------------------------------------------------------------
+
+    def _draw_volume(self, draw, state: OverlayState) -> None:
+        t = self._theme
+        vx, vy, vw, vh = layout.VOLUME_BAR.rect
+        track_y = vy + vh / 2
+        _icon_speaker(draw, vx - 30, track_y, vh * 0.7, _hex_rgba(t.fg, 210), muted=state.volume <= 0)
+
+        draw.line([(vx, track_y), (vx + vw, track_y)], fill=_hex_rgba(t.fg, 60), width=4)
+        vfrac = max(0.0, min(1.0, state.volume / 100.0))
+        vfill_x = vx + vw * vfrac
+        if vfrac > 0:
+            draw.line([(vx, track_y), (vfill_x, track_y)], fill=_hex_rgba(t.fg, 220), width=4)
+        draw.ellipse([vfill_x - 7, track_y - 7, vfill_x + 7, track_y + 7],
+                     fill=_hex_rgba(t.fg), outline=_hex_rgba(t.fg, 235), width=2)
+        pct = f"{state.volume}%"
+        self._shadowed_text(draw, (vx + vw + 12, track_y - 8), pct, self._font_time,
+                             _hex_rgba(t.fg, 220))
+
+
+# -- standalone vector icon helpers (module-level: no per-button state needed) --
+
+def _heart_glyph(draw, cx, cy, s, fg, filled: bool) -> None:
+    """A real heart outline (parametric heart curve). Filled only when
+    curated=True — a stronger, more universally understood "liked" signal
+    than an outline heart, and small relative to whatever it sits on.
+    """
+    n = 48
+    raw = []
+    for i in range(n):
+        t = 2 * math.pi * i / n
+        hx = 16 * math.sin(t) ** 3
+        hy = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
+        raw.append((hx, -hy))
+    xs = [p[0] for p in raw]
+    ys = [p[1] for p in raw]
+    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+    target = s * 2.1
+    scale = target / max(maxx - minx, maxy - miny)
+    ox = cx - (minx + maxx) / 2 * scale
+    oy = cy - (miny + maxy) / 2 * scale
+    pts = [(ox + px * scale, oy + py * scale) for px, py in raw]
+    draw.polygon(pts, outline=fg, width=2, fill=fg if filled else None)
+
+
+def _skip_glyph(draw, cx, cy, s, fg, direction: int) -> None:
+    """Standard "skip to next/previous" icon: two triangles + an end bar
+    (⏭ / ⏮), built symmetrically from one direction sign.
+    """
+    tri_h = s
+    tri_w = s * 0.62
+    gap = tri_w * 0.18
+    x0 = cx - direction * (tri_w + gap / 2)
+    x1 = x0 + direction * tri_w
+    draw.polygon([(x0, cy - tri_h), (x0, cy + tri_h), (x1, cy)], fill=fg)
+    x2 = x1 + direction * gap
+    x3 = x2 + direction * tri_w
+    draw.polygon([(x2, cy - tri_h), (x2, cy + tri_h), (x3, cy)], fill=fg)
+    bar_x = x3 + direction * (gap * 0.5)
+    draw.line([(bar_x, cy - tri_h), (bar_x, cy + tri_h)], fill=fg, width=3)
+
+
+def _scan_glyph(draw, cx, cy, s, fg) -> None:
+    """Refresh/rescan icon: a near-complete circular arc with a single
+    arrowhead — the standard "re-scan / reload" visual metaphor.
+    """
+    r = s * 0.85
+    bbox = [cx - r, cy - r, cx + r, cy + r]
+    draw.arc(bbox, start=20, end=330, fill=fg, width=2)
+    ang = math.radians(20)
+    tipx = cx + r * math.cos(ang)
+    tipy = cy + r * math.sin(ang)
+    ah = s * 0.38
+    draw.polygon([
+        (tipx + ah * 0.55, tipy - ah * 0.15),
+        (tipx - ah * 0.55, tipy + ah * 0.25),
+        (tipx + ah * 0.05, tipy + ah * 0.75),
+    ], fill=fg)
+
+
+def _icon_music_note(draw, cx, cy, s, fg) -> None:
+    stem_x = cx + s * 0.35
+    draw.line([(stem_x, cy - s * 1.1), (stem_x, cy + s * 0.55)], fill=fg, width=3)
+    draw.line([(stem_x, cy - s * 1.1), (stem_x + s * 0.7, cy - s * 0.85)], fill=fg, width=3)
+    draw.ellipse([stem_x - s * 0.55, cy + s * 0.15, stem_x - s * 0.05, cy + s * 0.65],
+                 outline=fg, width=2)
+
+
+def _icon_film(draw, cx, cy, s, fg) -> None:
+    x0, y0, x1, y1 = cx - s, cy - s * 0.7, cx + s, cy + s * 0.7
+    draw.rounded_rectangle([x0, y0, x1, y1], radius=4, outline=fg, width=2)
+    hole_r = s * 0.14
+    for hx in (x0 + s * 0.35, x1 - s * 0.35):
+        for hy in (y0 + s * 0.28, y1 - s * 0.28):
+            draw.ellipse([hx - hole_r, hy - hole_r, hx + hole_r, hy + hole_r], outline=fg, width=1)
+    draw.polygon([(cx - s * 0.25, cy - s * 0.32), (cx - s * 0.25, cy + s * 0.32), (cx + s * 0.35, cy)],
+                 fill=fg)
+
+
+def _icon_drive(draw, cx, cy, s, fg) -> None:
+    x0, y0, x1, y1 = cx - s * 0.9, cy - s * 0.6, cx + s * 0.9, cy + s * 0.6
+    draw.rounded_rectangle([x0, y0, x1, y1], radius=3, outline=fg, width=2)
+    draw.ellipse([x1 - s * 0.42, cy - s * 0.12, x1 - s * 0.18, cy + s * 0.12], outline=fg, width=1)
+
+
+def _icon_bluetooth(draw, cx, cy, s, fg) -> None:
+    x0, x1 = cx - s * 0.35, cx + s * 0.35
+    y0, y1, ym = cy - s, cy + s, cy
+    draw.line([(cx, y0), (cx, y1)], fill=fg, width=2)
+    draw.line([(cx, y0), (x1, cy - s * 0.5), (x0, cy + s * 0.5), (cx, y1)], fill=fg, width=2, joint="curve")
+    draw.line([(cx, y0), (x1, cy + s * 0.5), (x0, cy - s * 0.5), (cx, y1)], fill=fg, width=2, joint="curve")
+
+
+def _icon_airplay(draw, cx, cy, s, fg) -> None:
+    for i, r in enumerate((s * 0.95, s * 0.6)):
+        draw.arc([cx - r, cy - r, cx + r, cy + r], start=215, end=325, fill=fg, width=2)
+    tri = s * 0.32
+    draw.polygon([(cx - tri, cy + s * 0.35), (cx + tri, cy + s * 0.35), (cx, cy + s * 0.9)], fill=fg)
+
+
+def _icon_mic(draw, cx, cy, s, fg) -> None:
+    draw.rounded_rectangle([cx - s * 0.32, cy - s, cx + s * 0.32, cy + s * 0.25],
+                            radius=s * 0.3, outline=fg, width=2)
+    draw.arc([cx - s * 0.65, cy - s * 0.5, cx + s * 0.65, cy + s * 0.65], start=20, end=160, fill=fg, width=2)
+    draw.line([(cx, cy + s * 0.65), (cx, cy + s)], fill=fg, width=2)
+    draw.line([(cx - s * 0.35, cy + s), (cx + s * 0.35, cy + s)], fill=fg, width=2)
+
+
+def _icon_speaker(draw, cx, cy, s, fg, muted: bool) -> None:
+    box_w, box_h = s * 0.5, s * 0.7
+    draw.polygon([(cx - s, cy - box_h * 0.35), (cx - s + box_w * 0.5, cy - box_h * 0.35),
+                  (cx - s + box_w, cy - box_h), (cx - s + box_w, cy + box_h),
+                  (cx - s + box_w * 0.5, cy + box_h * 0.35), (cx - s, cy + box_h * 0.35)], fill=fg)
+    if muted:
+        x0 = cx - s * 0.05
+        draw.line([(x0, cy - s * 0.4), (x0 + s * 0.55, cy + s * 0.4)], fill=fg, width=2)
+        draw.line([(x0, cy + s * 0.4), (x0 + s * 0.55, cy - s * 0.4)], fill=fg, width=2)
+    else:
+        for i, r in enumerate((s * 0.5, s * 0.85)):
+            draw.arc([cx - s + box_w + r * 0.3, cy - r, cx - s + box_w + r * 0.3 + r * 2, cy + r],
+                      start=-45, end=45, fill=fg, width=2)
 
 
 def _fmt_time(seconds: float) -> str:
     seconds = max(0, int(seconds))
     return f"{seconds // 60}:{seconds % 60:02d}"
-
-
-# Rect aliases kept local to this module's draw calls above, sourced from
-# layout.py so drawing and hit-testing can never disagree.
-MODE_RECT = layout.MODE_PILL.rect
-STORAGE_RECT = layout.STORAGE_PILL.rect
-BT_RECT = layout.BT_ICON.rect
-AIRPLAY_RECT = layout.AIRPLAY_ICON.rect

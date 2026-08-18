@@ -1,32 +1,15 @@
 <?xml version="1.0" standalone='no'?>
 <!DOCTYPE service-group SYSTEM "avahi-service.dtd">
 <!--
-  /etc/avahi/services/smb.service
-
-  Advertises the SMB share over mDNS AND publishes a device-info record so
-  macOS Finder renders a proper icon in the sidebar instead of a generic
-  question-mark box. Without _device-info._tcp the share still works, but it
-  looks broken, which people report as a bug.
-
-  Restart after editing:  sudo systemctl restart avahi-daemon
-  Verify from a Mac:      dns-sd -B _smb._tcp
+  Advertises the SMB share over mDNS/Bonjour so it shows up under
+  "Network" / in Finder's sidebar as rpi-touch.local without needing a
+  manual \\rpi-touch\Music or smb://rpi-touch.local/Music path typed in.
+  Installed by install.sh to /etc/avahi/services/smb.service.
 -->
 <service-group>
-  <name replace-wildcards="yes">RPi-Audio (%h)</name>
-
+  <name replace-wildcards="yes">%h</name>
   <service>
     <type>_smb._tcp</type>
     <port>445</port>
-  </service>
-
-  <!--
-    Finder icon selection. Valid models include:
-      RackMac, MacPro, Xserve, MacMini, AirPort, TimeCapsule
-    MacMini reads well for a small always-on box.
-  -->
-  <service>
-    <type>_device-info._tcp</type>
-    <port>0</port>
-    <txt-record>model=MacMini</txt-record>
   </service>
 </service-group>
