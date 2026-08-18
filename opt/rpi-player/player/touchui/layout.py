@@ -259,6 +259,111 @@ def hit_test(x: int, y: int, mode: str) -> Button | None:
     return None
 
 
+# =============================================================================
+# NAVIGATION PAGES -- Bluetooth / AirPlay
+# =============================================================================
+# PROMPT #4 root cause: OverlayState only ever represented "music" or
+# "video" -- there was no page/navigation concept at all, so BT/AP taps had
+# nowhere to go and fell through to a silent no-op (see touch_daemon.py's
+# old _tap_route_icon). This mirrors the StreamDeck XL's real page model
+# (streamdeck_daemon.py's PAGE_BT_PICKER/PAGE_AIRPLAY_PICKER + a
+# _picker_return_page) instead of inventing a new one: same backend calls
+# (player/bt.py, player/wifi.py), same "list known devices immediately,
+# scan fills in the rest, selecting one dispatches pair/connect and returns
+# to whichever screen opened the page" behavior -- just laid out for a
+# touchscreen instead of a 32-key grid.
+#
+# PAGE_PLAYER is the existing music/video screen (state.mode still decides
+# which). PAGE_BT/PAGE_AIRPLAY are full 800x480 screens of their own with
+# their own button set below -- NOT overlays on top of the player screen,
+# which is what produced the old "HUD disappears, black screen" bug (an
+# overlay-visibility flag being reused as a fake page instead of a real
+# one). Returning from either page never touches player/mode.py's mode
+# file, so Music/Video state (and playback) is untouched by navigation, by
+# construction rather than by care taken to preserve it in each handler.
+PAGE_PLAYER = "player"
+PAGE_BT = "bt"
+PAGE_AIRPLAY = "airplay"
+
+_PAGE_HEADER_Y = 20
+_PAGE_HEADER_H = 44
+
+# Every sub-page shares this Back control in the same top-left corner --
+# one predictable "get me out of here" gesture regardless of which page
+# you're on. Same touch-target reasoning as the player header (>=44px).
+BACK_BTN = Button("_page_back", (20, _PAGE_HEADER_Y, 100, _PAGE_HEADER_H), "Back")
+
+# -- Bluetooth page ------------------------------------------------------------
+BT_SCAN_BTN  = Button("_bt_scan",  (556, _PAGE_HEADER_Y, 110, _PAGE_HEADER_H), "Scan")
+BT_RESET_BTN = Button("_bt_reset", (676, _PAGE_HEADER_Y, 104, _PAGE_HEADER_H), "Reset")
+
+# 6 device rows -- same slot count as the StreamDeck picker's 6 grid keys
+# (known devices first, then scan results), just stacked vertically instead
+# of laid out in a 6-column strip. y88-464 leaves clear margin above/below;
+# 56 tall rows easily clear the 44px touch-target minimum.
+BT_ROW_H = 58
+BT_ROW_GAP = 6
+BT_ENTRY_BUTTONS = tuple(
+    Button(f"_bt_entry:{i}", (20, 88 + i * (BT_ROW_H + BT_ROW_GAP), 760, BT_ROW_H), "")
+    for i in range(6)
+)
+
+_BT_PAGE_BUTTONS = (BACK_BTN, BT_SCAN_BTN, BT_RESET_BTN) + BT_ENTRY_BUTTONS
+
+# -- AirPlay page ---------------------------------------------------------------
+# Wi-Fi status/IP are read-only display (player/wifi.py.status()) -- same
+# non-tappable-rect treatment as the player screen's VOLUME_COMPACT_RECT.
+WIFI_INFO_RECT = (20, 76, 760, 56)
+
+# 3 sink rows (AirPlay candidate lists are normally short -- a handful of
+# configured routes, not dozens of BT devices) -- room enough for a taller,
+# more readable row than the BT page's since there's less to fit. (Was 4
+# rows; trimmed to 3 to make room for the SMB status card below without
+# crowding the Wi-Fi tool buttons -- see SMB_STATUS_RECT.)
+AIRPLAY_ROW_H = 58
+AIRPLAY_ROW_GAP = 6
+AIRPLAY_ENTRY_BUTTONS = tuple(
+    Button(f"_airplay_entry:{i}",
+           (20, 148 + i * (AIRPLAY_ROW_H + AIRPLAY_ROW_GAP), 760, AIRPLAY_ROW_H), "")
+    for i in range(3)
+)
+
+# SMB drop-folder server status (read-only -- see player/smb.py's module
+# docstring for why this lives on the AirPlay/network page rather than
+# its own picker page: there's no SMB client/picker to build, just a
+# status line, and this is already the network-diagnostics screen).
+SMB_STATUS_RECT = (20, 342, 760, 56)
+
+# Wi-Fi tools -- bottom row, deliberately away from the device list so a
+# slightly-off tap aiming for a sink can't land on "restart networking"
+# instead. Mirrors the StreamDeck picker's Reconnect/Fix pair.
+WIFI_RECONNECT_BTN = Button("_wifi_reconnect", (20, 416, 220, 44), "Reconnect Wi-Fi")
+WIFI_FIX_BTN        = Button("_wifi_fix",        (256, 416, 180, 44), "Fix Wi-Fi")
+
+_AIRPLAY_PAGE_BUTTONS = (BACK_BTN, WIFI_RECONNECT_BTN, WIFI_FIX_BTN) + AIRPLAY_ENTRY_BUTTONS
+
+
+def buttons_for_page(page: str) -> tuple[Button, ...]:
+    if page == PAGE_BT:
+        return _BT_PAGE_BUTTONS
+    if page == PAGE_AIRPLAY:
+        return _AIRPLAY_PAGE_BUTTONS
+    return ()
+
+
+def hit_test_page(x: int, y: int, page: str) -> Button | None:
+    """Same shape as hit_test(), but for a navigation page's button set —
+    deliberately NOT falling through to CONTENT_AREA: an empty tap on a
+    sub-page does nothing, same as an empty grid slot on the StreamDeck
+    picker pages did nothing.
+    """
+    for b in buttons_for_page(page):
+        bx, by, bw, bh = b.rect
+        if bx <= x < bx + bw and by <= y < by + bh:
+            return b
+    return None
+
+
 def rotate_point_180(x: int, y: int) -> tuple[int, int]:
     """Flip a raw touch coordinate 180 degrees within the WxH canvas.
 

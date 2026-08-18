@@ -98,11 +98,10 @@ Every draw call takes an ``opaque`` bool for this reason. VIDEO mode also
 never shows the decorative visualizer (spec: video prioritizes the video
 image itself, not audio-style decoration) — see render()'s mode check.
 
-The "visualizer" is NOT real spectrum analysis — this daemon has no
-access to decoded audio samples, only MPD/mpv's transport status — so
-rather than fake a live FFT it draws a stylized, deterministic bar
-pattern derived from elapsed playback time, purely decorative, and never
-claims to represent the actual audio.
+(Stale note removed: this paragraph used to say the visualizer was fake,
+deterministic decoration with no real audio data. That was true before
+v5 — see the "v5" section above, and audio_visualizer.py, for the real
+FFT-over-MPD's-fifo-tap pipeline that replaced it.)
 """
 
 from __future__ import annotations
@@ -167,6 +166,38 @@ class OverlayState:
     visualizer_bars: list = field(default_factory=list)  # real levels 0.0-1.0, see v5 docstring
     scanning: bool = False              # library rescan in progress -- see _scan_util_btn
 
+    # -- navigation pages (PROMPT #4) -----------------------------------------
+    # "player" (music/video, everything above) or a full sub-page -- see
+    # touchui/layout.py's PAGE_* constants and module docstring for why
+    # this replaced the old "just try to auto-switch" BT/AP tap behavior.
+    page: str = "player"
+    # Bluetooth page: each entry is (mac, name, connected). Known devices
+    # first, then scan results -- see player/bt.py's discover_devices().
+    bt_entries: list = field(default_factory=list)
+    bt_scanning: bool = False           # background bt.scan_async() in flight
+    bt_status: str = ""                 # "Connecting...", "Paired", "Pairing failed", ...
+    bt_reset_busy: bool = False         # bt.reset_failed_pairings_async() in flight
+    # AirPlay page: each entry is (label, active). Sourced from live
+    # PipeWire raop sinks matching a configured route -- see
+    # touch_daemon._enter_airplay_page / player/outputs.py.
+    airplay_entries: list = field(default_factory=list)
+    airplay_status: str = ""
+    # Wi-Fi status card + tool buttons -- player/wifi.py.status() dict
+    # (connected/ssid/signal/ip/powersave), read fresh each render.
+    wifi_status: dict = field(default_factory=dict)
+    wifi_reconnect_busy: bool = False
+    wifi_fix_busy: bool = False
+    # SMB drop-folder server status -- player/smb.py.status() dict
+    # (available/hostname/share). NOT an SMB client -- see that module's
+    # docstring. Shown on the same page as Wi-Fi since there's no
+    # dedicated SMB header button to navigate from.
+    smb_status: dict = field(default_factory=dict)
+
+    # Small transient status toast on the PLAYER screen itself (currently
+    # storage-switch feedback -- see touch_daemon._apply_toast).
+    toast_text: str = ""
+    toast_visible: bool = False
+
 
 def _hex_rgba(h: str, alpha: int = 255) -> tuple[int, int, int, int]:
     h = h.lstrip("#")
@@ -202,6 +233,34 @@ class Renderer:
         img = Image.new("RGBA", (layout.W, layout.H), (0, 0, 0, 0))
         opaque = state.mode == "music"
         accent = self._theme.accent_video if state.mode == "video" else self._theme.accent
+
+        # Navigation pages are complete, independent 800x480 frames -- NOT
+        # an overlay drawn on top of the player screen. That distinction is
+        # the actual fix for the "touching BT/AP blanks the HUD" bug: the
+        # old code toggled overlay_visible-style flags as a stand-in for a
+        # page and produced an incomplete frame; every state.page value
+        # here always produces a complete, self-contained, opaque frame.
+        # Defensive fallback: an unrecognized page value renders the
+        # player screen rather than nothing, per the "never render black"
+        # requirement -- this can only happen from a coding mistake
+        # upstream (an unknown string reaching OverlayState.page), and
+        # falling back to the player screen is safer than a blank frame.
+        if state.page == layout.PAGE_BT:
+            self._draw_backdrop(img)
+            draw = ImageDraw.Draw(img)
+            self._draw_bt_page(draw, state)
+            if rotate_180:
+                img = img.transpose(Image.ROTATE_180)
+            return img.tobytes("raw", "BGRA")
+
+        if state.page == layout.PAGE_AIRPLAY:
+            self._draw_backdrop(img)
+            draw = ImageDraw.Draw(img)
+            self._draw_airplay_page(draw, state)
+            if rotate_180:
+                img = img.transpose(Image.ROTATE_180)
+            return img.tobytes("raw", "BGRA")
+
         if state.overlay_visible:
             if opaque:
                 self._draw_backdrop(img)
@@ -222,6 +281,9 @@ class Renderer:
             # module docstring, item 2.
             draw = ImageDraw.Draw(img)
             self._draw_volume_hud(img, draw, state, accent)
+        if state.toast_visible and state.toast_text:
+            draw = ImageDraw.Draw(img)
+            self._draw_toast(draw, state.toast_text)
         if rotate_180:
             img = img.transpose(Image.ROTATE_180)
         # mpv's overlay-add "bgra" format wants byte order B,G,R,A per
@@ -670,6 +732,24 @@ class Renderer:
         draw.text((pct_x, cy), f"{state.volume}%", font=self._font_tag,
                   fill=_hex_rgba(t.fg_secondary, 230), anchor="lm")
 
+    def _draw_toast(self, draw, text: str) -> None:
+        """Small pill just under the header — storage-switch feedback
+        (PROMPT #4 part 15). Deliberately much smaller/quieter than the
+        volume HUD: this is a passive confirmation, not something the user
+        is actively mid-gesture on."""
+        t = self._theme
+        font = self._font_meta
+        tw = draw.textlength(text, font=font)
+        pad_x, h = 16, 30
+        w = tw + pad_x * 2
+        x = (layout.W - w) / 2
+        y = 66
+        draw.rounded_rectangle([x, y, x + w, y + h], radius=h / 2,
+                                fill=_hex_rgba(t.elevated, 230),
+                                outline=_hex_rgba(t.border, 220), width=1)
+        draw.text((layout.W / 2, y + h / 2), text, font=font,
+                  fill=_hex_rgba(t.fg, 235), anchor="mm")
+
     def _draw_volume_hud(self, img: Image.Image, draw, state: OverlayState, accent: str) -> None:
         """Transient centered card, shown only while
         ``state.volume_hud_visible`` (touch_daemon.py owns the ~1.5s timer
@@ -702,6 +782,155 @@ class Renderer:
         fill_x = bar_x0 + (bar_x1 - bar_x0) * vfrac
         if vfrac > 0:
             draw.line([(bar_x0, bar_y), (fill_x, bar_y)], fill=_hex_rgba(accent, 255), width=4)
+
+    # -- navigation pages (PROMPT #4) ------------------------------------------
+
+    def _draw_page_header(self, draw, title: str) -> None:
+        """Back button + page title -- shared shape for every sub-page.
+        Same visual language as the player header (dark surface pill,
+        thin border), not a generic OS-style back arrow."""
+        t = self._theme
+        x, y, w, h = layout.BACK_BTN.rect
+        draw.rounded_rectangle([x, y, x + w, y + h], radius=h / 2,
+                                fill=_hex_rgba(t.surface, 235),
+                                outline=_hex_rgba(t.border, 220), width=2)
+        draw.polygon([(x + 22, y + h / 2), (x + 34, y + h * 0.32), (x + 34, y + h * 0.68)],
+                     fill=_hex_rgba(t.fg, 255))
+        draw.text((x + 44, y + h / 2), "Back", font=self._font_pill,
+                  fill=_hex_rgba(t.fg, 255), anchor="lm")
+        draw.text((layout.W / 2, y + h / 2), title, font=self._font_title,
+                  fill=_hex_rgba(t.fg, 255), anchor="mm")
+
+    def _draw_page_row(self, draw, rect, primary: str, secondary: str = "",
+                        active: bool = False, dim: bool = False) -> None:
+        """One selectable row on a device-list page (BT/AirPlay entries).
+        `active` = currently connected/in-use (accent border+fill).
+        `dim` = empty/placeholder slot (no device in this row yet)."""
+        t = self._theme
+        x, y, w, h = rect
+        if active:
+            border = _hex_rgba(t.active, 255)
+            fill = _hex_rgba(t.active, 45)
+        else:
+            border = _hex_rgba(t.border, 200 if not dim else 110)
+            fill = _hex_rgba(t.surface, 200 if not dim else 90)
+        draw.rounded_rectangle([x, y, x + w, y + h], radius=14, fill=fill, outline=border, width=2)
+        fg = _hex_rgba(t.fg if not dim else t.fg_secondary, 235 if not dim else 160)
+        draw.text((x + 20, y + h / 2 - (9 if secondary else 0)), primary,
+                  font=self._font_sub, fill=fg, anchor="lm")
+        if secondary:
+            draw.text((x + 20, y + h / 2 + 12), secondary, font=self._font_meta,
+                      fill=_hex_rgba(t.fg_secondary, 210), anchor="lm")
+        if active:
+            dot_r = 5
+            draw.ellipse([x + w - 20 - dot_r * 2, y + h / 2 - dot_r,
+                          x + w - 20, y + h / 2 + dot_r], fill=_hex_rgba(t.active, 255))
+
+    def _draw_page_button(self, draw, rect, label: str, busy: bool = False,
+                          warn: bool = False) -> None:
+        t = self._theme
+        x, y, w, h = rect
+        border = _hex_rgba(t.danger if warn else t.border, 220)
+        fill = _hex_rgba(t.danger if warn else t.surface, 55 if warn else 200)
+        draw.rounded_rectangle([x, y, x + w, y + h], radius=h / 2, fill=fill, outline=border, width=2)
+        text = f"{label}..." if busy else label
+        draw.text((x + w / 2, y + h / 2), text, font=self._font_pill,
+                  fill=_hex_rgba(t.fg, 235), anchor="mm")
+
+    def _draw_bt_page(self, draw, state: OverlayState) -> None:
+        """Reproduces the StreamDeck XL's PAGE_BT_PICKER: known devices
+        first, then scan results, filled in by player/bt.py — see
+        touch_daemon._enter_bt_page/_on_bt_entry_press for the actual
+        bt.py calls. This function only draws whatever touch_daemon.py
+        already collected into state.bt_entries/bt_scanning/bt_status;
+        it has no backend knowledge of its own (stateless renderer).
+        """
+        self._draw_page_header(draw, "BLUETOOTH")
+        self._draw_page_button(draw, layout.BT_SCAN_BTN.rect, "Scan", busy=state.bt_scanning)
+        self._draw_page_button(draw, layout.BT_RESET_BTN.rect, "Reset", busy=state.bt_reset_busy)
+
+        if state.bt_status:
+            draw.text((layout.W / 2, 66), state.bt_status, font=self._font_meta,
+                      fill=_hex_rgba(self._theme.fg_secondary, 220), anchor="mm")
+
+        rows = layout.BT_ENTRY_BUTTONS
+        for i, row in enumerate(rows):
+            if i < len(state.bt_entries):
+                mac, name, connected = state.bt_entries[i]
+                self._draw_page_row(draw, row.rect, name or mac,
+                                    "Connected" if connected else "Tap to connect",
+                                    active=connected)
+            elif i == 0 and state.bt_scanning and not state.bt_entries:
+                self._draw_page_row(draw, row.rect, "Scanning...", dim=True)
+            else:
+                self._draw_page_row(draw, row.rect, "", dim=True)
+
+    def _draw_airplay_page(self, draw, state: OverlayState) -> None:
+        """Reproduces the StreamDeck XL's PAGE_AIRPLAY_PICKER (live
+        PipeWire raop sinks) plus its Wi-Fi status/Reconnect/Fix tiles —
+        see touch_daemon._enter_airplay_page and player/wifi.py.
+        """
+        t = self._theme
+        self._draw_page_header(draw, "AIRPLAY")
+
+        # Wi-Fi status card -- read-only, mirrors wifi.status()'s fields.
+        wx, wy, ww, wh = layout.WIFI_INFO_RECT
+        draw.rounded_rectangle([wx, wy, wx + ww, wy + wh], radius=14,
+                                fill=_hex_rgba(t.surface, 200), outline=_hex_rgba(t.border, 200), width=2)
+        info = state.wifi_status or {}
+        if info.get("connected"):
+            ssid = info.get("ssid") or "?"
+            sig = info.get("signal")
+            ip = info.get("ip") or "?"
+            line = f"{ssid}   ·   Signal {sig}%" if sig is not None else ssid
+            draw.text((wx + 20, wy + wh * 0.32), line, font=self._font_sub,
+                      fill=_hex_rgba(t.fg, 235), anchor="lm")
+            draw.text((wx + 20, wy + wh * 0.72), f"IP {ip}", font=self._font_meta,
+                      fill=_hex_rgba(t.fg_secondary, 210), anchor="lm")
+        else:
+            draw.text((wx + 20, wy + wh / 2), "Wi-Fi: not connected", font=self._font_sub,
+                      fill=_hex_rgba(t.danger, 235), anchor="lm")
+
+        rows = layout.AIRPLAY_ENTRY_BUTTONS
+        for i, row in enumerate(rows):
+            if i < len(state.airplay_entries):
+                name, active = state.airplay_entries[i]
+                self._draw_page_row(draw, row.rect, name,
+                                    "Connected" if active else "Available", active=active)
+            else:
+                self._draw_page_row(draw, row.rect, "", dim=True)
+
+        if not state.airplay_entries:
+            ex, ey, ew, eh = rows[0].rect
+            draw.text((ex + 20, ey + eh / 2), "No AirPlay devices found",
+                      font=self._font_meta, fill=_hex_rgba(t.fg_secondary, 200), anchor="lm")
+
+        # SMB drop-folder server status -- NOT a client/picker, just a
+        # status line (see player/smb.py's module docstring + layout.py's
+        # SMB_STATUS_RECT comment for why it lives on this page).
+        sx, sy, sw, sh = layout.SMB_STATUS_RECT
+        draw.rounded_rectangle([sx, sy, sx + sw, sy + sh], radius=14,
+                                fill=_hex_rgba(t.surface, 200), outline=_hex_rgba(t.border, 200), width=2)
+        smb = state.smb_status or {}
+        available = smb.get("available")
+        if available is True:
+            share = smb.get("share") or "Music"
+            host = smb.get("hostname") or "?"
+            draw.text((sx + 20, sy + sh * 0.32), "SMB server: available",
+                      font=self._font_sub, fill=_hex_rgba(t.active, 235), anchor="lm")
+            draw.text((sx + 20, sy + sh * 0.72), f"\\\\{host}\\{share}",
+                      font=self._font_meta, fill=_hex_rgba(t.fg_secondary, 210), anchor="lm")
+        elif available is False:
+            draw.text((sx + 20, sy + sh / 2), "SMB server: offline — check Samba service",
+                      font=self._font_sub, fill=_hex_rgba(t.danger, 235), anchor="lm")
+        else:
+            draw.text((sx + 20, sy + sh / 2), "SMB server: status unknown",
+                      font=self._font_sub, fill=_hex_rgba(t.fg_secondary, 210), anchor="lm")
+
+        self._draw_page_button(draw, layout.WIFI_RECONNECT_BTN.rect, "Reconnect Wi-Fi",
+                               busy=state.wifi_reconnect_busy)
+        self._draw_page_button(draw, layout.WIFI_FIX_BTN.rect, "Fix Wi-Fi",
+                               busy=state.wifi_fix_busy)
 
 
 # -- standalone vector icon helpers (module-level: no per-button state needed) --

@@ -55,14 +55,17 @@ from .actions import (
     video_storage_label,
 )
 from .audio_visualizer import AudioVisualizer
+from . import bt as _bt
 from .config import Config, load_config, setup_logging
 from . import mode as _mode
 from .ipc import BusServer, NullBus
 from .mpdbus import MpdCommander
 from .outputs import OutputRouter
+from . import smb as _smb
 from .touchui import layout
 from .touchui.render import OverlayState, Renderer, Theme
 from .video import VideoCommander, VideoLibrary
+from . import wifi as _wifi
 
 LOG = logging.getLogger("touch")
 
@@ -119,6 +122,13 @@ _VOLUME_HUD_HOLD = 1.5
 # real feedback for a directory walk of a typical library, short enough
 # that it can't get stuck "on" if rescan() throws.
 _VIDEO_SCAN_PULSE_HOLD = 2.0
+
+# How long a page-level status message (BT "Connecting...", "Paired",
+# "Pairing failed", etc.) or the player screen's small storage-switch
+# toast stays visible before clearing itself. Long enough to read, short
+# enough not to look stuck once the operation is actually done.
+_BT_STATUS_HOLD = 2.5
+_TOAST_HOLD = 1.8
 
 
 def find_touch_device(explicit_path: str = "") -> "evdev.InputDevice | None":
@@ -297,6 +307,46 @@ class TouchDaemon:
         # have. See _dispatch_button and _apply_scan_pulse.
         self._video_scan_pulse_until: float = 0.0
 
+        # -- navigation pages (PROMPT #4) -------------------------------------
+        # See touchui/layout.py's PAGE_* module docstring for why this
+        # exists: BT/AP taps used to blindly auto-switch to the first
+        # available route with no page to show for it. This reproduces the
+        # StreamDeck XL's real PAGE_BT_PICKER/PAGE_AIRPLAY_PICKER behavior
+        # (same player/bt.py and player/wifi.py calls) on the touchscreen.
+        # Navigating to/from a page never touches player/mode.py's mode
+        # file, so it can never affect which of Music/Video is "current" or
+        # disturb playback — see _enter_bt_page/_enter_airplay_page.
+        self._page: str = layout.PAGE_PLAYER
+
+        # Bluetooth page state.
+        self._bt_entries: list[tuple[str, str, bool]] = []  # (mac, name, connected)
+        self._bt_scanning: bool = False
+        self._bt_status: str = ""
+        self._bt_status_until: float = 0.0
+        self._bt_reset_busy: bool = False
+        self._bt_connected_mac: str = ""  # last MAC successfully paired this run
+
+        # AirPlay page state -- self._airplay_sinks holds the live PwSink
+        # objects (needed by switch_to_sink on selection), not just labels.
+        self._airplay_sinks: list = []
+        self._airplay_active_label: str = ""
+
+        # Wi-Fi status (used on the AirPlay page) -- cached and refreshed
+        # only while that page is open (see _enter_airplay_page /
+        # _collect_state), not polled every render tick on the player
+        # screen where it's irrelevant.
+        self._wifi_status_cache: dict = {}
+        self._wifi_reconnect_busy: bool = False
+        self._wifi_fix_busy: bool = False
+        self._smb_status_cache: dict = {}
+
+        # Generic small transient status toast for the player screen itself
+        # (currently just storage-switch feedback — PROMPT #4 part 15:
+        # "currently a storage change can appear as though nothing
+        # happened"). Same re-armed-deadline pattern as _volume_hud_until.
+        self._toast_text: str = ""
+        self._toast_until: float = 0.0
+
     # -- lifecycle -----------------------------------------------------------
 
     def stop(self, *_: object) -> None:
@@ -411,6 +461,14 @@ class TouchDaemon:
         self._down_x, self._down_y = self._x, self._y
         self._down_at = time.monotonic()
         self._gesture = None
+        if self._page != layout.PAGE_PLAYER:
+            # Navigation pages (BT/AirPlay) have their own button set and
+            # no drag/gesture/auto-hide behavior at all -- see
+            # layout.hit_test_page and _dispatch_page_button.
+            self._down_button = layout.hit_test_page(self._x, self._y, self._page)
+            LOG.debug("touch down at (%d, %d) on page %s -> %s", self._x, self._y,
+                      self._page, self._down_button.action if self._down_button else None)
+            return
         mode = _mode.read_mode(self._mode_file)
         self._down_button = layout.hit_test(self._x, self._y, mode)
         LOG.debug("touch down at (%d, %d) -> %s", self._x, self._y,
@@ -451,6 +509,21 @@ class TouchDaemon:
         self._pressed_action = ""
         if button is None:
             return
+
+        if self._page != layout.PAGE_PLAYER:
+            # Same "release must land back on the same button" tap-cancel
+            # rule as the player screen, just against the page's own
+            # button set/hit-test (see layout.hit_test_page). No gestures,
+            # no overlay auto-hide, no CONTENT_AREA catch-all on a
+            # sub-page -- an empty tap here is simply a no-op.
+            released_on = layout.hit_test_page(self._x, self._y, self._page)
+            if released_on is not button:
+                return
+            LOG.info("touch tap (page=%s) -> %s", self._page, button.action)
+            self._dispatch_page_button(button)
+            self._render_and_push(force=True)
+            return
+
         if was_pressed:
             # Clear Delete's armed-red visual immediately rather than
             # waiting for the next periodic tick (up to ~1s away per
@@ -592,14 +665,24 @@ class TouchDaemon:
         if action == "_toggle_mode":
             dispatch("exit_video_mode" if mode == "video" else "enter_video_mode", self._ctx)
         elif action == "_toggle_storage":
-            dispatch("video_toggle_storage_source" if mode == "video"
-                      else "toggle_storage_source", self._ctx)
+            # Restored to the SAME real action the StreamDeck XL uses
+            # (actions.py's toggle_storage_source/video_toggle_storage_source
+            # — symlink swap + mpd/video library refresh). Tracing this
+            # this round found it was already wired correctly; the only
+            # real gap was zero visible feedback (PROMPT #4 part 15), which
+            # is what the toast below adds — it does NOT fake success
+            # before the swap actually happens, since dispatch() runs
+            # synchronously and we only set the toast from its real result.
+            result = dispatch("video_toggle_storage_source" if mode == "video"
+                              else "toggle_storage_source", self._ctx)
+            self._toast_text = result or "Storage switch failed"
+            self._toast_until = time.monotonic() + _TOAST_HOLD
         elif action == "_toggle_overlay":
             self._overlay_visible = not self._overlay_visible
         elif action == "_open_bt":
-            self._tap_route_icon("bluetooth")
+            self._enter_bt_page()
         elif action == "_open_airplay":
-            self._tap_route_icon("airplay")
+            self._enter_airplay_page()
         elif action == "update_database":
             # Debounce: MPD itself refuses a second concurrent update, but
             # it does so by returning an error we'd otherwise just swallow
@@ -626,20 +709,177 @@ class TouchDaemon:
         else:
             dispatch(action, self._ctx)
 
-    def _tap_route_icon(self, icon: str) -> None:
-        """Route icon tap, v1: switch straight to the first available route
-        with this icon. No picker UI yet (the wireframe's BT/AirPlay icons
-        were reviewed as single-tap-to-connect for a first pass — a real
-        multi-device picker, like the Stream Deck's, is follow-up work,
-        same open item as the AirPlay picker for the TourBox path).
+    # -- navigation pages (PROMPT #4) -----------------------------------------
+    # Reproduces streamdeck_daemon.py's PAGE_BT_PICKER/PAGE_AIRPLAY_PICKER
+    # behavior on the touchscreen, calling the SAME player/bt.py and
+    # player/wifi.py backend functions (see this module's imports) rather
+    # than reimplementing pairing/Wi-Fi. Entering a page never writes to
+    # player/mode.py, so Music/Video mode and playback are untouched by
+    # navigation — see _collect_state, which still reads the real mode
+    # file on every render regardless of self._page.
+
+    def _enter_bt_page(self) -> None:
+        """Mirrors streamdeck_daemon._enter_bt_picker: show whatever
+        bluetoothd already knows about immediately (fast, no scan), then
+        kick a background scan and refresh the list once it completes.
         """
-        route = next((r for r in self._router.routes
-                       if r.icon == icon and self._router.is_available(r)), None)
-        if route is None:
-            LOG.info("route tap: no available %s route right now", icon)
+        self._page = layout.PAGE_BT
+        self._bt_entries = [(mac, name, self._bt_is_connected(mac))
+                            for mac, name in _bt.known_audio_devices()]
+        self._bt_scanning = True
+        self._bt_reset_busy = False
+        self._bt_status = "Scanning..."
+        self._bt_status_until = time.monotonic() + _BT_STATUS_HOLD
+
+        def on_scan_done(devices: list[tuple[str, str]]) -> None:
+            self._bt_entries = [(mac, name, self._bt_is_connected(mac)) for mac, name in devices]
+            self._bt_scanning = False
+            self._render_and_push(force=True)
+
+        _bt.scan_async(on_scan_done)
+
+    def _bt_is_connected(self, mac: str) -> bool:
+        """Whether this device is the one the router currently has active
+        — used to put a "Connected" tag + accent on the right row. Cheap:
+        only compares against the single current route, no extra bt.py
+        call per row per render.
+        """
+        route = self._router.current()
+        return bool(route) and route.icon == "bluetooth" and self._bt_connected_mac == mac
+
+    def _on_bt_entry_press(self, slot: int) -> None:
+        if slot >= len(self._bt_entries):
             return
-        LOG.info("route tap -> %s", route.id)
-        self._router.switch_to(route)
+        mac, name, _connected = self._bt_entries[slot]
+        self._bt_status = "Connecting..."
+        self._bt_status_until = time.monotonic() + _BT_STATUS_HOLD
+
+        def on_done(ok: bool) -> None:
+            if ok:
+                bt_route = next((r for r in self._router.routes if r.id == "bt"), None)
+                if bt_route is not None:
+                    self._router.switch_to(bt_route)
+                self._bt_connected_mac = mac
+                self._bt_status = f"Paired: {name[:20]}"
+            else:
+                self._bt_status = "Pairing failed"
+            self._bt_status_until = time.monotonic() + _BT_STATUS_HOLD
+            # Refresh connected-state tags on whatever's still in the list.
+            self._bt_entries = [(m, n, self._bt_is_connected(m)) for m, n, _c in self._bt_entries]
+            self._render_and_push(force=True)
+
+        _bt.pair_and_connect_async(mac, on_done)
+
+    def _on_bt_reset_press(self) -> None:
+        if self._bt_reset_busy:
+            return  # already running -- ignore a double-tap
+        self._bt_reset_busy = True
+        self._bt_status = "Resetting..."
+        self._bt_status_until = time.monotonic() + _BT_STATUS_HOLD
+
+        def on_done(count: int) -> None:
+            self._bt_reset_busy = False
+            self._bt_status = f"Reset {count} pairing(s)" if count else "Nothing stuck"
+            self._bt_status_until = time.monotonic() + _BT_STATUS_HOLD
+            self._render_and_push(force=True)
+
+        _bt.reset_failed_pairings_async(on_done)
+
+    def _enter_airplay_page(self) -> None:
+        """Mirrors streamdeck_daemon._enter_airplay_picker: only sinks
+        matching a configured icon="airplay" route, not every raop_sink on
+        the LAN (see that method's docstring on why — a stranger's laptop
+        with AirPlay receiving on should never show up here).
+        """
+        self._page = layout.PAGE_AIRPLAY
+        self._refresh_airplay_sinks()
+        self._wifi_status_cache = _wifi.status()
+        # SMB (drop-folder server) status -- see player/smb.py's module
+        # docstring for why this lives here rather than a dedicated page:
+        # this is already the network-diagnostics screen, and there is no
+        # separate SMB header button/action to navigate from (part 16 was
+        # explicit there's no SMB client to build a picker for).
+        self._smb_status_cache = _smb.status()
+
+    def _refresh_airplay_sinks(self) -> None:
+        live_sinks = self._router.pw.list_sinks()
+        picks = []
+        for route in self._router.routes:
+            if route.icon != "airplay" or not route.pw_sink:
+                continue
+            sink = next((s for s in live_sinks if s.matches(route.pw_sink)), None)
+            if sink is not None:
+                picks.append(sink)
+        self._airplay_sinks = picks
+
+    def _on_airplay_entry_press(self, slot: int) -> None:
+        if slot >= len(self._airplay_sinks):
+            return
+        sink = self._airplay_sinks[slot]
+        if self._router.switch_to_sink(sink):
+            self._airplay_active_label = sink.description or sink.name
+            # Navigating here must never stop playback (PROMPT #4 part 14)
+            # — switch_to_sink() only changes PipeWire's default sink and
+            # MPD's active output, exactly like the header AP pill used to
+            # do; it does not touch mpd.stop()/mpv at all, so an
+            # already-playing track keeps playing straight through this.
+            if self._video is not None and _mode.read_mode(self._mode_file) == "video":
+                self._video.set_audio_device("auto")
+                self._video.reload_audio()
+        self._render_and_push(force=True)
+
+    def _on_wifi_reconnect_press(self) -> None:
+        if self._wifi_reconnect_busy:
+            return
+        self._wifi_reconnect_busy = True
+        self._render_and_push(force=True)
+
+        def on_done(ok: bool) -> None:
+            self._wifi_reconnect_busy = False
+            self._wifi_status_cache = _wifi.status()
+            self._render_and_push(force=True)
+
+        _wifi.reconnect_async(on_done)
+
+    def _on_wifi_fix_press(self) -> None:
+        if self._wifi_fix_busy:
+            return
+        self._wifi_fix_busy = True
+        self._render_and_push(force=True)
+
+        def on_done(ok: bool) -> None:
+            self._wifi_fix_busy = False
+            self._wifi_status_cache = _wifi.status()
+            self._render_and_push(force=True)
+
+        _wifi.restart_networking_async(on_done)
+
+    def _dispatch_page_button(self, button: layout.Button) -> None:
+        action = button.action
+        if action == "_page_back":
+            # Never touches player/mode.py — returning to the player
+            # screen always shows whichever of Music/Video was already
+            # active (PROMPT #4 part 3/12), since that's read fresh from
+            # the mode file on every render regardless of self._page.
+            self._page = layout.PAGE_PLAYER
+            return
+        if self._page == layout.PAGE_BT:
+            if action == "_bt_scan":
+                self._enter_bt_page()
+            elif action == "_bt_reset":
+                self._on_bt_reset_press()
+            elif action.startswith("_bt_entry:"):
+                self._on_bt_entry_press(int(action.split(":", 1)[1]))
+            return
+        if self._page == layout.PAGE_AIRPLAY:
+            if action == "_wifi_reconnect":
+                self._on_wifi_reconnect_press()
+            elif action == "_wifi_fix":
+                self._on_wifi_fix_press()
+            elif action.startswith("_airplay_entry:"):
+                self._on_airplay_entry_press(int(action.split(":", 1)[1]))
+            return
+        LOG.warning("unhandled page button %r on page %r", action, self._page)
 
     # -- idle video plane ----------------------------------------------------
 
@@ -678,7 +918,38 @@ class TouchDaemon:
     def _collect_state(self) -> OverlayState:
         mode = _mode.read_mode(self._mode_file)
         state = OverlayState(mode=mode, overlay_visible=self._overlay_visible,
-                              pressed_action=self._pressed_action)
+                              pressed_action=self._pressed_action, page=self._page)
+
+        if self._page == layout.PAGE_BT:
+            # Sub-pages are complete, independent frames (see render.py's
+            # render()) -- no need to also collect music/video/art state
+            # nobody will draw while this page is open.
+            now = time.monotonic()
+            state.bt_entries = list(self._bt_entries)
+            state.bt_scanning = self._bt_scanning
+            state.bt_status = self._bt_status if now < self._bt_status_until else ""
+            state.bt_reset_busy = self._bt_reset_busy
+            return state
+
+        if self._page == layout.PAGE_AIRPLAY:
+            # Re-queries live PipeWire sinks on every render tick (a cheap
+            # local query, not a network call) so a speaker appearing or
+            # disappearing on the LAN while this page is open is reflected
+            # without needing to leave and reopen the page — PROMPT #4
+            # part 10 ("display the actual AirPlay devices currently
+            # available"), which a one-shot snapshot at page-open time
+            # would not satisfy.
+            self._refresh_airplay_sinks()
+            state.airplay_entries = [
+                (s.description or s.name,
+                 (s.description or s.name) == self._airplay_active_label or s.is_default)
+                for s in self._airplay_sinks
+            ]
+            state.wifi_status = self._wifi_status_cache
+            state.wifi_reconnect_busy = self._wifi_reconnect_busy
+            state.wifi_fix_busy = self._wifi_fix_busy
+            state.smb_status = self._smb_status_cache
+            return state
 
         route = self._router.current()
         state.route_icon = route.icon if route else ""
@@ -804,6 +1075,17 @@ class TouchDaemon:
         """
         state.volume_hud_visible = time.monotonic() < self._volume_hud_until
 
+    def _apply_toast(self, state: OverlayState) -> None:
+        """Mirror self._toast_text/_toast_until (set by e.g. the storage
+        switch, see _dispatch_button) into state.toast_visible/toast_text
+        — same per-render mirroring pattern as _apply_volume_hud."""
+        if time.monotonic() < self._toast_until and self._toast_text:
+            state.toast_visible = True
+            state.toast_text = self._toast_text
+        else:
+            state.toast_visible = False
+            state.toast_text = ""
+
     def _video_format_tags(self) -> list[str]:
         """Resolution/codec/aspect/fps chips for the header — mirrors the
         mockup's "1920x1080 | H.264 | 16:9 | 29.97 fps" row. Queried live
@@ -875,6 +1157,7 @@ class TouchDaemon:
 
         self._apply_auto_hide(state)
         self._apply_volume_hud(state)
+        self._apply_toast(state)
 
         frame = self._renderer.render(state, self._touch.rotate_180)
         self._last_render_at = time.monotonic()
