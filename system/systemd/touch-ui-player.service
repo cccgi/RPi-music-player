@@ -1,0 +1,84 @@
+[Unit]
+Description=Touch UI overlay + input for the rpi-touch (7in DSI touchscreen) profile
+Documentation=file:/opt/rpi-player/docs/ROADMAP.md
+
+# Needs MPD for music-mode state and video-mpv for both video-mode state AND
+# the actual overlay-add IPC target — rendering before either is up just
+# means a few seconds of "nothing playing"/failed overlay-add retries, not a
+# hard failure (both are handled with broad try/except in touch_daemon.py).
+After=mpd.service video-mpv.service
+Wants=mpd.service video-mpv.service
+
+# rpi-touch profile only. Stream Deck XL is not part of this hardware setup
+# (see docs/DEPLOY.md's touch-profile section) — no ordering relationship to
+# streamdeck-player.service needed or wanted here.
+
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+# input: read /dev/input/eventN for the touch panel. No custom udev rule
+# needed for this one — Debian's stock udev rules already create
+# /dev/input/event* as root:input mode 0660, so being IN the "input" group
+# is sufficient (confirm with `ls -l /dev/input/event*` on the Pi; if the
+# DSI panel's node ever shows a different group, that's the one to add a
+# rule for, same pattern as 99-streamdeck.rules does for the Stream Deck's
+# hidraw node).
+# audio: needed for wpctl/pw-dump enumeration via this daemon's own
+# OutputRouter instance, same as tourbox-player/streamdeck-player.
+SupplementaryGroups=input audio
+
+WorkingDirectory=/opt/rpi-player
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=RPI_PLAYER_HOME=/opt/rpi-player
+
+# Same PipeWire access requirement as tourbox-player/streamdeck-player/
+# video-mpv (see their comments) — this daemon runs its own OutputRouter
+# instance to drive the BT/AirPlay pills and route-picker taps.
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PIPEWIRE_RUNTIME_DIR=/run/user/1000
+
+ExecStart=/opt/rpi-player/venv/bin/python -m player.touch_daemon
+
+Restart=always
+RestartSec=3
+
+# --- Scheduling ---------------------------------------------------------
+# Same rationale as streamdeck-player: overlay compositing is bursty and
+# must never delay audio. Touch response itself is cheap (a hit-test + a
+# dispatch() call); the expensive part is the Pillow render, which is what
+# this Nice/IOScheduling pair is protecting everything else from.
+Nice=5
+IOSchedulingClass=idle
+
+# --- Runtime directory ----------------------------------------------------
+# Deliberately NOT declared here. The overlay bitmap this daemon writes
+# (config.toml's [touch] overlay_path, default
+# /run/rpi-player-video/overlay.bgra) lives inside video-mpv.service's OWN
+# RuntimeDirectory=rpi-player-video — see that unit's long comment on why a
+# runtime directory shared across multiple *owning* units (RuntimeDirectory=
+# declared in more than one unit) has a documented teardown race. This unit
+# only ever WRITES into a directory video-mpv.service owns and created; it
+# does not declare ownership of it itself. SupplementaryGroups=video-mpv's
+# Group (pi, via ReadWritePaths below) is what grants the write, not a
+# RuntimeDirectory= stanza here.
+ReadWritePaths=-/run/rpi-player-video
+
+# --- Hardening --------------------------------------------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

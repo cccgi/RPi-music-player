@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""AVRCP ↔ MPD bridge — hardened edition.
+
+Registers a BlueZ MediaPlayer1 object so that connected Bluetooth devices
+acting as AVRCP Controllers (Bose QC45 headphone buttons, Toyota Camry
+steering wheel) can control MPD playback.  Also pushes current track
+metadata back to BlueZ so devices that support AVRCP metadata can display
+song title/artist/album.
+
+Hardening over the initial version:
+  • Watches for device connect/disconnect via BlueZ D-Bus signals and forces
+    a full metadata push 2 s after each connect (AVRCP session needs a moment
+    to fully establish before it can accept metadata).
+  • Watches for bluetoothd disappear/reappear and re-registers the player
+    automatically, so a bluetoothd restart does not permanently break AVRCP.
+  • 30 s heartbeat re-push as a belt-and-suspenders fallback for any missed
+    PropertiesChanged signals.
+  • Position is only pushed on track/state changes, not on every idle tick
+    (continuous position spam confused the Camry head unit and caused it to
+    drop AVRCP metadata periodically).
+  • Logging goes to stdout → journald with a syslog identifier, so
+    `journalctl --user -u avrcp-bridge` shows useful output.
+
+Signal flow:
+  BT device (AVRCP Controller)
+      │ AVRCP PASSTHROUGH
+      ▼
+    BlueZ  (routes to our registered /org/rpi_player/mpd object)
+      │ org.bluez.MediaPlayer1 method calls
+      ▼
+  this daemon  ──► MPD  (python-mpd2)
+
+Metadata push:
+  MPD ──idle──► this daemon ──PropertiesChanged──► BlueZ ──AVRCP──► device display
+                              ──on connect (2s delayed)──► BlueZ
+                              ──every 30 s heartbeat──────► BlueZ
+
+Run as user 'rpi'.  Uses system Python3 + system dbus-python + system
+python-mpd2.  Not compatible with the player venv (dbus-python not in venv).
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+import threading
+import time
+
+import dbus
+import dbus.service
+import dbus.mainloop.glib
+from gi.repository import GLib
+import mpd as _mpd
+
+# ---- logging ----------------------------------------------------------------
+# Write to stdout so the systemd user unit (StandardOutput=journal) routes it
+# to journald and `journalctl --user -u avrcp-bridge` shows the output.
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%H:%M:%S",
+)
+LOG = logging.getLogger("avrcp-bridge")
+
+# ---- constants --------------------------------------------------------------
+_BLUEZ_SVC          = "org.bluez"
+_BLUEZ_MEDIA_IFACE  = "org.bluez.Media1"
+_BLUEZ_PLAYER_IFACE = "org.bluez.MediaPlayer1"
+_DBUS_OBJMGR_IFACE  = "org.freedesktop.DBus.ObjectManager"
+_DBUS_PROPS_IFACE   = "org.freedesktop.DBus.Properties"
+
+_ADAPTER_PATH  = "/org/bluez/hci0"
+_PLAYER_PATH   = "/org/rpi_player/mpd"
+_MPD_HOST      = "localhost"
+_MPD_PORT      = 6600
+
+# Delay between a device connecting and our first metadata push.
+# AVRCP needs a moment to fully negotiate before it will accept our metadata.
+_RECONNECT_PUSH_DELAY_MS = 2000
+
+# Heartbeat: re-push all metadata unconditionally this often (ms).
+_HEARTBEAT_INTERVAL_MS = 30_000
+
+
+# =============================================================================
+# MediaPlayer D-Bus object — BlueZ calls these methods on AVRCP commands
+# =============================================================================
+
+class _MediaPlayer(dbus.service.Object):
+
+    def __init__(self, bus: dbus.SystemBus, path: str) -> None:
+        dbus.service.Object.__init__(self, bus, path)
+        # Shadow of what we last pushed to BlueZ. Used to diff-push.
+        # Position is excluded from diff: we only push it with track changes.
+        self._props: dict = {
+            "Name":     dbus.String("MPD"),
+            "Type":     dbus.String("Audio"),
+            "Status":   dbus.String("stopped"),
+            "Position": dbus.UInt32(0),
+            "Track":    dbus.Dictionary({}, signature="sv"),
+            "Shuffle":  dbus.String("off"),
+            "Repeat":   dbus.String("off"),
+        }
+        # Separate tracking for whether the track changed (triggers Position push)
+        self._last_song_id: str = ""
+
+    # -------------------------------------------------------------------------
+    # AVRCP control commands → MPD
+    # -------------------------------------------------------------------------
+
+    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
+    def Play(self) -> None:
+        LOG.info("AVRCP → Play")
+        _mpd_cmd("play")
+
+    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
+    def Pause(self) -> None:
+        LOG.info("AVRCP → Pause")
+        _mpd_cmd("pause", 1)
+
+    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
+    def Stop(self) -> None:
+        LOG.info("AVRCP → Stop")
+        _mpd_cmd("stop")
+
+    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
+    def Next(self) -> None:
+        LOG.info("AVRCP → Next")
+        _mpd_cmd("next")
+
+    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
+    def Previous(self) -> None:
+        LOG.info("AVRCP → Previous")
+        _mpd_cmd("previous")
+
+    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
+    def FastForward(self) -> None:
+        LOG.info("AVRCP → FastForward (+15s)")
+        _mpd_cmd("seekcur", "+15")
+
+    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
+    def Rewind(self) -> None:
+        LOG.info("AVRCP → Rewind (-15s)")
+        _mpd_cmd("seekcur", "-15")
+
+    # -------------------------------------------------------------------------
+    # D-Bus Properties interface
+    # -------------------------------------------------------------------------
+
+    @dbus.service.method(_DBUS_PROPS_IFACE, in_signature="ss", out_signature="v")
+    def Get(self, iface: str, name: str):
+        return self._props.get(name, dbus.String(""))
+
+    @dbus.service.method(_DBUS_PROPS_IFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, iface: str) -> dict:
+        return self._props if iface == _BLUEZ_PLAYER_IFACE else {}
+
+    @dbus.service.method(_DBUS_PROPS_IFACE, in_signature="ssa{sv}")
+    def Set(self, iface: str, name: str, value) -> None:
+        pass  # read-only from BlueZ's perspective
+
+    @dbus.service.signal(_DBUS_PROPS_IFACE, signature="sa{sv}as")
+    def PropertiesChanged(self, iface: str, changed: dict, invalidated: list) -> None:
+        pass
+
+    # -------------------------------------------------------------------------
+    # MPD state → BlueZ player properties
+    # -------------------------------------------------------------------------
+
+    def update_from_mpd(self, status: dict, song: dict, force: bool = False) -> bool:
+        """Compute new props from MPD state, diff against last push, and emit
+        PropertiesChanged for anything that changed.
+
+        ``force=True`` sends every property unconditionally — used on reconnect
+        and heartbeat so a freshly-connected device gets full metadata even if
+        MPD state hasn't changed since last push.
+
+        Returns False (for GLib.idle_add / GLib.timeout_add — don't repeat).
+        """
+        mpd_state   = status.get("state", "stop")
+        bluez_state = {"play": "playing", "pause": "paused", "stop": "stopped"}.get(
+            mpd_state, "stopped"
+        )
+
+        # Build Track dict from MPD song info
+        track: dict[str, dbus.types.Any] = {}
+        if song:
+            if t := song.get("title"):
+                track["Title"]  = dbus.String(t)
+            if a := song.get("artist"):
+                track["Artist"] = dbus.String(a)
+            if al := song.get("album"):
+                track["Album"]  = dbus.String(al)
+            if n := song.get("track"):
+                try:
+                    track["TrackNumber"] = dbus.UInt32(int(str(n).split("/")[0]))
+                except (ValueError, TypeError):
+                    pass
+            if d := song.get("duration"):
+                try:
+                    track["Duration"] = dbus.UInt32(int(float(d) * 1000))
+                except (ValueError, TypeError):
+                    pass
+
+        shuffle = "on" if status.get("random", "0") == "1" else "off"
+        if status.get("repeat", "0") == "1":
+            repeat = "singletrack" if status.get("single", "0") == "1" else "alltracks"
+        else:
+            repeat = "off"
+
+        # Detect track change — drives whether we include Position in the push
+        song_id = song.get("id", "") if song else ""
+        track_changed = song_id != self._last_song_id
+        if track_changed:
+            self._last_song_id = song_id
+
+        # Compute Position (ms) — only push it on track/state changes
+        state_changed = bluez_state != str(self._props.get("Status", ""))
+        push_position = track_changed or state_changed or force
+        if push_position:
+            elapsed = status.get("elapsed", "0")
+            try:
+                pos_ms = dbus.UInt32(int(float(elapsed) * 1000))
+            except (ValueError, TypeError):
+                pos_ms = dbus.UInt32(0)
+        else:
+            pos_ms = None
+
+        # Accumulate changed properties
+        new_props: dict[str, dbus.types.Any] = {
+            "Status":  dbus.String(bluez_state),
+            "Track":   dbus.Dictionary(track, signature="sv"),
+            "Shuffle": dbus.String(shuffle),
+            "Repeat":  dbus.String(repeat),
+        }
+        if pos_ms is not None:
+            new_props["Position"] = pos_ms
+
+        changed: dict[str, dbus.types.Any] = {}
+        for key, val in new_props.items():
+            if force or self._props.get(key) != val:
+                self._props[key] = val
+                changed[key]     = val
+
+        if changed:
+            title = str(track.get("Title", "?"))
+            LOG.info("→ BlueZ AVRCP push: status=%s track=%r changed=%s",
+                     bluez_state, title, list(changed))
+            self.PropertiesChanged(_BLUEZ_PLAYER_IFACE, changed, [])
+
+        return False  # GLib idle callback: don't repeat
+
+
+# =============================================================================
+# Bridge manager — handles lifecycle, reconnects, heartbeat
+# =============================================================================
+
+class _BridgeManager:
+    """Keeps the BlueZ player registration alive and handles reconnects."""
+
+    def __init__(self, bus: dbus.SystemBus, player: _MediaPlayer) -> None:
+        self._bus    = bus
+        self._player = player
+        self._reconnect_timers: dict[str, int] = {}  # object_path → GLib source id
+
+        # Watch for BlueZ appearing/disappearing (bluetoothd restart)
+        self._bus.watch_name_owner(_BLUEZ_SVC, self._on_bluez_owner_changed)
+
+        # Watch PropertiesChanged on ALL BlueZ objects: catches "Connected" flips
+        self._bus.add_signal_receiver(
+            self._on_dbus_properties_changed,
+            dbus_interface=_DBUS_PROPS_IFACE,
+            signal_name="PropertiesChanged",
+            bus_name=_BLUEZ_SVC,
+            path_keyword="path",
+        )
+
+        # 30-second heartbeat: unconditional full re-push
+        GLib.timeout_add(_HEARTBEAT_INTERVAL_MS, self._heartbeat)
+
+    # ---- BlueZ lifecycle ----------------------------------------------------
+
+    def _on_bluez_owner_changed(self, owner: str) -> None:
+        if owner:
+            LOG.warning("BlueZ appeared (owner=%s) — re-registering player in 3 s", owner)
+            GLib.timeout_add(3000, self._reregister_player)
+        else:
+            LOG.warning("BlueZ disappeared — player registration lost")
+
+    def _reregister_player(self) -> bool:
+        """Try to re-register with BlueZ after it restarts.
+
+        AlreadyExists means our original RegisterPlayer call is still active
+        (watch_name_owner fires even when BlueZ is already up at startup).
+        Treat it as success and just push a fresh metadata snapshot.
+        Any other error means BlueZ isn't fully up yet — retry in 5 s.
+        """
+        try:
+            adapter = dbus.Interface(
+                self._bus.get_object(_BLUEZ_SVC, _ADAPTER_PATH),
+                _BLUEZ_MEDIA_IFACE,
+            )
+            adapter.RegisterPlayer(
+                dbus.ObjectPath(_PLAYER_PATH),
+                {"Name": dbus.String("MPD"), "Type": dbus.String("Audio")},
+            )
+            LOG.info("Re-registered BlueZ MediaPlayer1 at %s", _PLAYER_PATH)
+        except dbus.DBusException as exc:
+            if "AlreadyExists" in str(exc):
+                # Our registration is still alive — nothing to do except push state
+                LOG.debug("Re-register: already registered (normal at startup)")
+            else:
+                LOG.error("Re-register failed: %s — will retry in 5 s", exc)
+                GLib.timeout_add(5000, self._reregister_player)
+                return False
+        self._schedule_force_push("reregister")
+        return False  # don't repeat the initial timeout_add
+
+    # ---- Device connect/disconnect watching ---------------------------------
+
+    def _on_dbus_properties_changed(
+        self, iface: str, changed: dict, invalidated: list, path: str = ""
+    ) -> None:
+        if iface != "org.bluez.Device1":
+            return
+        connected = changed.get("Connected")
+        if connected is None:
+            return
+        if bool(connected):
+            LOG.info("BT device connected: %s — scheduling metadata push in %d ms",
+                     path, _RECONNECT_PUSH_DELAY_MS)
+            self._schedule_force_push(path)
+        else:
+            LOG.info("BT device disconnected: %s", path)
+            # Cancel any pending push timer for this device
+            if path in self._reconnect_timers:
+                GLib.source_remove(self._reconnect_timers.pop(path))
+
+    def _schedule_force_push(self, key: str) -> None:
+        """Cancel any existing push timer for ``key`` and schedule a new one."""
+        if key in self._reconnect_timers:
+            GLib.source_remove(self._reconnect_timers[key])
+        timer_id = GLib.timeout_add(
+            _RECONNECT_PUSH_DELAY_MS,
+            lambda: self._do_force_push(key),
+        )
+        self._reconnect_timers[key] = timer_id
+
+    def _do_force_push(self, key: str) -> bool:
+        self._reconnect_timers.pop(key, None)
+        LOG.info("Force metadata push (trigger=%s)", key)
+        _push_current_mpd_state(self._player, force=True)
+        return False
+
+    # ---- Heartbeat ----------------------------------------------------------
+
+    def _heartbeat(self) -> bool:
+        LOG.debug("Heartbeat: re-pushing metadata to all AVRCP devices")
+        _push_current_mpd_state(self._player, force=True)
+        return True  # repeat
+
+
+# =============================================================================
+# MPD helpers
+# =============================================================================
+
+def _mpd_cmd(command: str, *args) -> None:
+    """One-shot MPD command: connect, run, disconnect."""
+    try:
+        c = _mpd.MPDClient()
+        c.connect(_MPD_HOST, _MPD_PORT)
+        getattr(c, command)(*args)
+        c.close()
+        c.disconnect()
+    except Exception as exc:
+        LOG.warning("MPD command '%s %s' failed: %s", command, args, exc)
+
+
+def _push_current_mpd_state(player: _MediaPlayer, force: bool = False) -> None:
+    """Read current MPD state synchronously and push it to BlueZ."""
+    try:
+        c = _mpd.MPDClient()
+        c.connect(_MPD_HOST, _MPD_PORT)
+        status = c.status()
+        song   = c.currentsong()
+        c.close()
+        c.disconnect()
+        player.update_from_mpd(status, song, force=force)
+    except Exception as exc:
+        LOG.warning("MPD state read failed: %s", exc)
+
+
+def _mpd_watcher(player: _MediaPlayer) -> None:
+    """Background thread: blocks on MPD idle events, pushes state changes."""
+    c = _mpd.MPDClient()
+    while True:
+        try:
+            c.connect(_MPD_HOST, _MPD_PORT)
+            LOG.info("MPD idle watcher connected")
+            # Push initial state
+            GLib.idle_add(player.update_from_mpd, c.status(), c.currentsong(), False)
+            while True:
+                c.idle("player", "mixer", "options")
+                GLib.idle_add(player.update_from_mpd, c.status(), c.currentsong(), False)
+        except Exception as exc:
+            LOG.warning("MPD watcher error: %s — reconnecting in 3 s", exc)
+            try:
+                c.disconnect()
+            except Exception:
+                pass
+            time.sleep(3)
+
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+def main() -> None:
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+
+    # Register our MediaPlayer1 object
+    player = _MediaPlayer(bus, _PLAYER_PATH)
+
+    adapter = dbus.Interface(
+        bus.get_object(_BLUEZ_SVC, _ADAPTER_PATH),
+        _BLUEZ_MEDIA_IFACE,
+    )
+    try:
+        adapter.RegisterPlayer(
+            dbus.ObjectPath(_PLAYER_PATH),
+            {"Name": dbus.String("MPD"), "Type": dbus.String("Audio")},
+        )
+        LOG.info("Registered BlueZ MediaPlayer1 at %s", _PLAYER_PATH)
+    except dbus.DBusException as exc:
+        LOG.error("RegisterPlayer failed: %s", exc)
+        sys.exit(1)
+
+    # Lifecycle manager: reconnect watching + heartbeat
+    _BridgeManager(bus, player)
+
+    # MPD idle watcher in background thread
+    loop = GLib.MainLoop()
+    watcher = threading.Thread(
+        target=_mpd_watcher, args=(player,), daemon=True, name="mpd-idle"
+    )
+    watcher.start()
+
+    LOG.info(
+        "AVRCP bridge ready — AVRCP Controller devices can now control MPD "
+        "(heartbeat every %d s, reconnect push delay %d ms)",
+        _HEARTBEAT_INTERVAL_MS // 1000,
+        _RECONNECT_PUSH_DELAY_MS,
+    )
+    try:
+        loop.run()
+    finally:
+        try:
+            adapter.UnregisterPlayer(dbus.ObjectPath(_PLAYER_PATH))
+        except Exception:
+            pass
+        LOG.info("AVRCP bridge stopped")
+
+
+if __name__ == "__main__":
+    main()

@@ -28,7 +28,9 @@ import logging
 import re
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
+from typing import Callable
 
 from .config import Route
 from .mpdbus import MpdCommander
@@ -456,6 +458,62 @@ class OutputRouter:
             LOG.info("clamping volume %d%% -> %d%% for AirPlay", current, AIRPLAY_SAFE_VOLUME)
             self._mpd.set_volume(AIRPLAY_SAFE_VOLUME)
 
+    def _sink_is_airplay(self, sink: PwSink) -> bool:
+        """True if ``sink`` is (or looks like) an AirPlay/RAOP destination.
+
+        Checked two ways: against every configured ``[[routes]]`` entry with
+        ``icon == "airplay"`` (the normal case), OR generically against the
+        ``raop_sink`` substring PipeWire's RAOP module always puts in
+        node.name (covers an AirPlay picker selection with no matching
+        ``[[routes]]`` entry at all — see ``switch_to_sink()``).
+        """
+        for route in self._routes:
+            if route.icon == "airplay" and route.pw_sink and sink.matches(route.pw_sink):
+                return True
+        return sink.matches("raop_sink")
+
+    def airplay_is_active(self) -> bool:
+        """Is the PipeWire default sink an AirPlay destination RIGHT NOW?
+
+        Checked against live PipeWire truth, not this router's cached
+        ``_current_id`` — see ``enforce_volume_safety()`` for why that
+        distinction is the whole point.
+        """
+        default = next((s for s in self._pw.list_sinks() if s.is_default), None)
+        return default is not None and self._sink_is_airplay(default)
+
+    def enforce_volume_safety(self) -> bool:
+        """Actively guard against an AirPlay sink ever playing at full
+        volume, regardless of how it became the PipeWire default.
+
+        ``switch_to()`` / ``switch_to_sink()`` / ``reassert_current()`` all
+        clamp MPD's volume — but only at the moment THIS process explicitly
+        changes the route, or right before playback (re)starts. None of
+        those cover the case that actually caused a real blast in the
+        field: WirePlumber can silently repoint PipeWire's default sink to
+        AirPlay entirely on its own — most commonly when a Bluetooth device
+        drops out (powered off, walked out of range) and its bluez_output
+        node disappears mid-song, and WirePlumber's own session-manager
+        policy picks the next available sink as the new default with zero
+        involvement from this codebase. MPD just keeps streaming to
+        whatever is now default, at whatever software volume it already had
+        (frequently 100% — a bit-perfect Local session, or a value simply
+        never lowered because nothing here ever ran) — with no route
+        switch, no reassert, nothing to trigger the existing clamps.
+
+        Meant to be polled on a short timer (see ``OutputSafetyWatcher``),
+        not just at explicit switch points, so "an AirPlay speaker never
+        blasts at full volume" holds even when the reroute happens entirely
+        outside this codebase's control, mid-playback. Returns whether
+        AirPlay is (still) the active destination, so a caller that also
+        owns a second mixer (mpv, in video mode) knows whether it needs to
+        clamp that one too.
+        """
+        active = self.airplay_is_active()
+        if active:
+            self._clamp_airplay_volume()
+        return active
+
     def switch_to_sink(self, sink: PwSink) -> bool:
         """Activate an arbitrary PipeWire sink directly, bypassing the
         [[routes]] table entirely.
@@ -588,3 +646,52 @@ class OutputRouter:
         if target.id == (current.id if current else None):
             return current
         return target if self.switch_to(target) else current
+
+
+class OutputSafetyWatcher:
+    """Polls ``OutputRouter.enforce_volume_safety()`` on a short timer.
+
+    Exists because the failure mode it guards against — WirePlumber
+    silently repointing PipeWire's default sink to AirPlay when a Bluetooth
+    device drops out mid-song — produces no MPD idle event and passes
+    through no explicit route-switch call anywhere in this codebase. There
+    is nothing to hang the check off of; the only way to catch it is to
+    keep checking. Runs on its own daemon thread so it works whether or not
+    a screen is attached, same rationale as ``ContinuousPlayback``.
+
+    ``interval_seconds`` is the worst-case exposure window: a drift that
+    happens right after one tick is caught by the next. Kept short — this
+    is a safety net, not a UI refresh — and cheap: one ``pw-dump`` call per
+    tick, which is what ``is_available()``/rendering already pay elsewhere.
+    """
+
+    def __init__(
+        self,
+        router: OutputRouter,
+        interval_seconds: float = 1.5,
+        on_tick: Callable[[bool], None] | None = None,
+    ) -> None:
+        self._router = router
+        self._interval = interval_seconds
+        self._on_tick = on_tick
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="output-safety",
+        )
+        self._thread.start()
+        LOG.info("output safety watchdog started (every %.1fs)", self._interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            try:
+                active = self._router.enforce_volume_safety()
+                if self._on_tick is not None:
+                    self._on_tick(active)
+            except Exception:  # noqa: BLE001 - never kill the watchdog thread
+                LOG.exception("output safety watchdog error")

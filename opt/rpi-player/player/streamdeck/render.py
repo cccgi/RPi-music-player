@@ -14,6 +14,7 @@ Design constraints that shape this module:
 from __future__ import annotations
 
 import logging
+import math
 import zlib
 from dataclasses import dataclass
 from functools import lru_cache
@@ -186,10 +187,18 @@ class KeyRenderer:
         *,
         sub: str = "",
         colour: str | None = None,
+        sub_colour: str | None = None,
         bg: str | None = None,
         highlight: bool = False,
     ) -> Image.Image:
-        """A general text key with an optional smaller second line."""
+        """A general text key with an optional smaller second line.
+
+        ``sub_colour`` overrides the sub-line's usual theme.muted grey —
+        added specifically for the video page's "Sing" key: on the
+        highlight=True accent-blue background, theme.muted's grey "Karaoke"
+        sub-text is low-contrast, so that call site passes black there while
+        leaving the main "Sing" title at its normal white.
+        """
         image, draw = self._blank(bg)
         if highlight:
             self._rounded_bg(draw, self.theme.accent)
@@ -214,7 +223,7 @@ class KeyRenderer:
         if sub:
             sub_fitted, sub_font = _fit_text(draw, sub, self.theme.font_regular, 88, 15)
             draw.text((48, 68), sub_fitted, font=sub_font,
-                      fill=self.theme.muted, anchor="mm")
+                      fill=sub_colour or self.theme.muted, anchor="mm")
         return image
 
     def glyph(
@@ -326,6 +335,50 @@ class KeyRenderer:
         if muted:
             draw.text((48, 82), "MUTED", font=_font(self.theme.font_bold, 11),
                       fill=self.theme.warn, anchor="mm")
+        return image
+
+    def volume_bar(self, percent: int | None, muted: bool = False,
+                    position: int | None = None, total: str | int | None = None) -> Image.Image:
+        """Compact volume gauge for the (0,6) tile on both the music and
+        video pages, sharing the key with the playlist-position readout
+        that used to live there alone (the old "2 of 5"-style
+        ``queue_position`` tile) — queue position in the top two-thirds
+        (same prominence it always had), a thin volume bar in the bottom
+        third underneath it.
+
+        ``percent`` is None when there is no mixer available (mirrors
+        ``volume()``'s own None handling). ``position``/``total`` are None
+        when there's nothing queued (the video page's "0 of 0" case) — in
+        which case only the volume half is drawn, no dangling "of 0".
+        """
+        image, draw = self._blank()
+
+        # --- top two-thirds: queue position, same layout the old
+        # queue_position tile used (big number + "of N" underneath) -------
+        if position is not None and total is not None:
+            draw.text((48, 30), str(position), font=_font(self.theme.font_bold, 26),
+                      fill=self.theme.fg, anchor="mm")
+            draw.text((48, 54), f"of {total}", font=_font(self.theme.font_regular, 13),
+                      fill=self.theme.muted, anchor="mm")
+
+        # --- bottom third: bar + percent ----------------------------------
+        if percent is None:
+            draw.text((48, 80), "—", font=_font(self.theme.font_bold, 15),
+                      fill=self.theme.muted, anchor="mm")
+        else:
+            bar_x0, bar_x1, bar_y0, bar_y1 = 14, 82, 70, 80
+            draw.rounded_rectangle([bar_x0, bar_y0, bar_x1, bar_y1], radius=3, fill="#2C2C2E")
+            fill_colour = self.theme.muted if muted else self.theme.accent
+            if percent > 0:
+                filled_w = int((bar_x1 - bar_x0) * (percent / 100))
+                if filled_w > 0:
+                    draw.rounded_rectangle(
+                        [bar_x0, bar_y0, bar_x0 + filled_w, bar_y1], radius=3, fill=fill_colour,
+                    )
+            pct_colour = self.theme.warn if muted else self.theme.muted
+            label = "Muted" if muted else f"{percent}%"
+            draw.text((48, 90), label, font=_font(self.theme.font_regular, 11),
+                      fill=pct_colour, anchor="mm")
         return image
 
     def route(self, label: str, active: bool, available: bool) -> Image.Image:
@@ -475,17 +528,42 @@ class KeyRenderer:
             y += 16
         return image
 
-    def browse_nav(self, label: str, sub: str = "", enabled: bool = True) -> Image.Image:
-        """Back / page keys for the browser."""
+    def browse_nav(self, label: str, sub: str = "", enabled: bool = True,
+                    icon: str | None = None) -> Image.Image:
+        """Back / page keys for the browser.
+
+        ``icon`` picks the shape explicitly; when omitted this falls back to
+        the original label-based guess (``"Back"`` -> the arrow-plus-bar
+        shape, anything else -> the double-down-chevron "more" shape) so
+        existing callers that never pass it (e.g. browse_root's "Library"
+        key) keep their exact old appearance. "folder_up"/"cycle" were added
+        for the page-1 browser's Back/Page keys specifically, after those
+        keys' original arrow-triangle shapes were reported as too similar to
+        the transport seek buttons' rew/ffwd icons to tell apart at a
+        glance.
+        """
         image, draw = self._blank()
         fg = self.theme.fg if enabled else "#48484A"
         sub_fg = self.theme.muted if enabled else "#3A3A3C"
 
         cx, cy = 48, 36
-        if label == "Back":
+        effective_icon = icon or ("back" if label == "Back" else "more")
+
+        if effective_icon == "folder_up":
+            # Single upward triangle over a short bar -- "go up one level".
+            # Vertical single-triangle, deliberately unlike rew/ffwd's
+            # horizontal DOUBLE triangles.
+            draw.polygon([(cx - 12, cy + 8), (cx + 12, cy + 8), (cx, cy - 14)], fill=fg)
+            draw.rectangle([cx - 14, cy + 10, cx + 14, cy + 16], fill=fg)
+        elif effective_icon == "cycle":
+            # An open circular arc -- reads as "cycle/rotate to the next
+            # page", nothing like the seek buttons' straight-line triangles.
+            draw.arc([cx - 18, cy - 18, cx + 18, cy + 18], start=25, end=305,
+                     fill=fg, width=4)
+        elif effective_icon == "back":
             draw.polygon([(cx + 10, cy - 16), (cx + 10, cy + 16), (cx - 14, cy)], fill=fg)
             draw.rectangle([cx - 20, cy - 16, cx - 16, cy + 16], fill=fg)
-        else:  # page / more
+        else:  # page / more (legacy default)
             for i, dy in enumerate((-12, 2)):
                 draw.polygon([(cx - 14, cy + dy), (cx + 14, cy + dy),
                               (cx, cy + dy + 12)], fill=fg)
@@ -528,6 +606,9 @@ _ROUTE_GLYPHS = {
     "bluetooth": "bluetooth",
     "airplay": "airplay",
     "hdmi": "hdmi",
+    # Page-2's Internal/USB storage-source quick-select keys reuse route()
+    "internal": "sdcard",
+    "usb": "usb_drive",
 }
 
 
@@ -648,6 +729,79 @@ def _draw_symbol(draw: ImageDraw.ImageDraw, symbol: str, cy: int, fill: str) -> 
         draw.arc([cx - 17, cy - 17, cx + 17, cy + 17], start=300, end=240,
                  fill=fill, width=4)
         draw.line([(cx, cy - 22), (cx, cy - 2)], fill=fill, width=4)
+
+    elif symbol == "heart":
+        # Two touching circular lobes plus a triangle point -- the Curate
+        # button (move the currently playing file into a Curated/
+        # subfolder), coloured red at the call site so it reads as a
+        # "favourite this" action rather than a generic label button.
+        lobe_r = 11
+        lobe_cy = cy - 6
+        draw.ellipse([cx - 2 * lobe_r, lobe_cy - lobe_r, cx, lobe_cy + lobe_r], fill=fill)
+        draw.ellipse([cx, lobe_cy - lobe_r, cx + 2 * lobe_r, lobe_cy + lobe_r], fill=fill)
+        draw.polygon([(cx - 2 * lobe_r, lobe_cy), (cx + 2 * lobe_r, lobe_cy),
+                      (cx, cy + 20)], fill=fill)
+
+    elif symbol == "chevron_down":
+        # Single downward triangle -- page 1's "enter the page-2 browser"
+        # key, paired with "chevron_up" below on page 2's way back.
+        draw.polygon([(cx - 18, cy - 10), (cx + 18, cy - 10), (cx, cy + 14)], fill=fill)
+
+    elif symbol == "chevron_up":
+        draw.polygon([(cx - 18, cy + 10), (cx + 18, cy + 10), (cx, cy - 14)], fill=fill)
+
+    elif symbol == "refresh":
+        # Circular reload arrow -- the video page's "Reinit" key (restarts
+        # mpv to force a fresh HDMI/DRM output probe — see actions.
+        # video_reinit). A near-full circular arc plus an arrowhead at one
+        # end, the standard "reload/restart" visual language, deliberately
+        # unlike "cycle" (browse_nav's plain open arc, no arrowhead) so the
+        # two don't get confused despite both being circular.
+        radius = 20
+        draw.arc([cx - radius, cy - radius, cx + radius, cy + radius],
+                 start=25, end=320, fill=fill, width=4)
+        # Arrowhead at the arc's start (25 degrees), pointing along the
+        # direction of travel.
+        rad = math.radians(25)
+        tip = (cx + radius * math.cos(rad), cy + radius * math.sin(rad))
+        draw.polygon([
+            (tip[0] - 9, tip[1] - 3), (tip[0] + 2, tip[1] + 9), (tip[0] + 9, tip[1] - 6),
+        ], fill=fill)
+
+    elif symbol == "sdcard":
+        # Internal storage: the classic SD-card silhouette (body with one
+        # corner notched) plus a row of contact pins near the top -- reads
+        # as "storage medium" at a glance, unlike the generic "speaker"
+        # glyph route() fell back to before storage_select got its own
+        # entries in _ROUTE_GLYPHS (reported live as "doesn't fit context
+        # at all", since Internal/USB have nothing to do with audio output).
+        w, h = 26, 34
+        x0, y0 = cx - w // 2, cy - h // 2
+        x1, y1 = cx + w // 2, cy + h // 2
+        notch = 10
+        draw.polygon([
+            (x0, y0 + notch), (x0 + notch, y0), (x1, y0),
+            (x1, y1), (x0, y1),
+        ], fill=fill)
+        pin_y0, pin_y1 = y0 + 6, y0 + 14
+        for i in range(4):
+            px = x0 + notch + 2 + i * 4
+            draw.line([(px, pin_y0), (px, pin_y1)], fill="#101014", width=2)
+
+    elif symbol == "usb_drive":
+        # USB thumb-drive: a body plus a narrower stepped connector on top
+        # with two notch lines -- the standard USB-stick silhouette, kept
+        # visually distinct from "sdcard" above so Internal vs USB read
+        # apart instantly rather than needing the caption to disambiguate.
+        body_w, body_h = 24, 20
+        bx0, by0 = cx - body_w // 2, cy - 2
+        bx1, by1 = cx + body_w // 2, cy + body_h - 2
+        draw.rounded_rectangle([bx0, by0, bx1, by1], radius=4, fill=fill)
+        conn_w = 12
+        draw.rectangle([cx - conn_w // 2, cy - 20, cx + conn_w // 2, cy - 1], fill=fill)
+        for dy in (-16, -10):
+            draw.line([(cx - conn_w // 2, cy + dy), (cx + conn_w // 2, cy + dy)],
+                      fill="#101014", width=2)
 
     elif symbol in ("wifi", "wifi_off"):
         # Classic three-arc-over-a-dot glyph, same "arcs" language as

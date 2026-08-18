@@ -1,0 +1,358 @@
+# /opt/rpi-player/etc/config.toml — TOUCH PROFILE (rpi-touch, Pi 5 + 7" DSI)
+#
+# Template for the touch-ui branch's hardware profile: no Stream Deck, no
+# USB DAC on this Pi, TourBox optional/secondary. Deployed as the starting
+# config.toml for rpi-touch; edited in place on the device from there —
+# not overwritten by updates (install.sh preserves it).
+#
+# Reload after editing:
+#   sudo systemctl restart tourbox-player touch-ui-player
+
+[mpd]
+# TCP on loopback. A path here would make python-mpd2 use a Unix socket, which
+# is marginally lower latency — but MPD's socket under systemd's
+# RuntimeDirectory=mpd proved unreliable: `ss -lxn` reported it LISTENing while
+# the path did not exist on disk, so every client failed with ENOENT. On
+# loopback the latency difference is irrelevant; reliability is not.
+host = "127.0.0.1"
+port = 6600
+timeout = 10.0
+idle_timeout = 0          # 0 = block forever in idle; we use select() anyway
+
+[ipc]
+# Lightweight NDJSON broadcast bus. Used for things MPD does not model:
+# on-screen toast messages, shutdown coordination, route-change hints.
+# Daemons run fine if this socket is absent — it is a nicety, not a dependency.
+socket = "/run/rpi-player/bus.sock"
+enabled = true
+
+[log]
+level = "INFO"            # DEBUG | INFO | WARNING | ERROR
+
+
+# =============================================================================
+# TourBox
+# =============================================================================
+[tourbox]
+device = "/dev/tourbox"
+baud = 115200
+# If the symlink is missing, scan these globs for a device that answers.
+fallback_globs = ["/dev/ttyACM*"]
+reconnect_delay = 2.0
+
+# Send the unlock handshake (55 00 07 88 94 00 1A FE) on connect.
+#
+# Elite / Elite Plus REQUIRE this before they report anything.
+# The NEO does NOT — it streams button events with no handshake, and its reply
+# is a ~26-byte frame padded with 0x00, which is the Tall button's code. The
+# daemon drops any read >= 8 bytes as a response frame, but there is no reason
+# to invite the hazard on a device that does not need it.
+#
+# Set true only if you swap to an Elite.
+send_unlock = false
+
+# How long a button must be held to count as a long-press.
+# Trade-off: any control with a long-press action has its SHORT press delayed
+# by this much. Keep it off the hot path (play/pause, volume).
+long_press_seconds = 0.45
+
+# Rotary controls emit one tick per detent. Coalesce ticks inside this window
+# into a single larger step so a fast spin does not flood MPD with 40 commands.
+rotary_coalesce_seconds = 0.06
+
+[tourbox.steps]
+volume = 3                # percent per detent
+volume_fast = 10          # percent per detent when spun quickly
+seek = 15                 # seconds per step (rewind / fast-forward)
+# Coarse scrub. Used by seek_*_fast, which the keymap binds to the Folder
+# layer's Left/Right and to shift+Left/Right on the Track layer.
+seek_fast = 30            # seconds
+# A spin faster than this (detents/sec) uses the _fast step values.
+# Measured across the actual burst; a single isolated detent is never "fast".
+fast_threshold = 8.0
+
+# Safety clamps on ONE coalesced burst. A hard flick of the knob can register
+# 40+ detents; without a clamp that multiplies by volume_fast and slams the
+# volume to 0 or 100, which is startling on headphones. Raise if you find the
+# control too damped.
+max_volume_jump = 25      # percent
+max_seek_jump = 120       # seconds
+
+
+# =============================================================================
+# Stream Deck XL
+# =============================================================================
+[streamdeck]
+brightness = 60           # percent; matters for battery life
+# Dim the panel after this many seconds with no interaction. 0 disables.
+dim_after_seconds = 120
+dim_brightness = 15
+# Blank entirely after this long. 0 disables.
+blank_after_seconds = 900
+
+# Stay at full brightness — no dim, no blank — for as long as something is
+# actively playing (music OR video). Playback is not 'interaction', so
+# without this the panel dims or goes dark mid-album/mid-video and looks
+# like the device has crashed — you then have to press a key you cannot see
+# to find out otherwise.
+# Set false if you would rather save the power on a battery build and don't
+# mind the panel dimming while playback continues.
+keep_awake_while_playing = true
+reconnect_delay = 3.0
+
+# Redraw the progress/elapsed key at most this often while playing.
+# The rest of the panel is event-driven via MPD idle.
+tick_seconds = 1.0
+
+[streamdeck.theme]
+bg = "#101014"
+fg = "#F2F2F7"
+muted = "#8E8E93"
+accent = "#0A84FF"
+active = "#30D158"
+warn = "#FF9F0A"
+# Point at the system fonts from the fonts-dejavu-core package, which
+# install.sh guarantees. Override these to ship a custom face in
+# /opt/rpi-player/assets/fonts/ — render.py falls back to these paths if your
+# override is missing, so a bad path degrades to plain rather than to the
+# unreadable PIL bitmap default.
+font_regular = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+
+# =============================================================================
+# Output routing
+# =============================================================================
+# Two-layer model:
+#   mpd_output  -> which MPD audio_output block to enable (exclusively)
+#   pw_sink     -> which PipeWire sink to make default (only when mpd_output
+#                  is the PipeWire one). Matched as a substring against
+#                  `wpctl status` node names, so partial names are fine.
+#
+# The TourBox "cycle output" action and the Stream Deck route key both walk
+# this list in order.
+
+[[routes]]
+id = "local"
+label = "Local"
+icon = "dac"
+mpd_output = "Local"
+pw_sink = ""
+
+[[routes]]
+id = "bt"
+label = "BT"
+icon = "bluetooth"
+mpd_output = "Network"
+pw_sink = "bluez_output"          # matches node.name, e.g. bluez_output.C8_7B_23_4A_F7_60.1
+# Bose QC45. Already paired+trusted (see bin/bt-connect), so "unavailable"
+# usually just means switched off or connected to a phone instead — bt_mac
+# lets the Stream Deck's BT key attempt bluetoothctl connect on press rather
+# than only reporting that fact.
+bt_mac = "C8:7B:23:4A:F7:60"
+
+# AirPlay needs module-raop-discover actually loaded to exist at all — see
+# system/pipewire/10-raop-discover.conf. Once loaded, PipeWire creates one
+# sink PER _raop._tcp announcement on the LAN, and that includes every Mac
+# with AirPlay receiving enabled, not just real speakers — `avahi-browse -rt
+# _raop._tcp` on this network turned up two actual speakers (a Bose
+# SoundTouch 30 and an Arylic 4stream) alongside two laptops that also
+# happen to advertise the same service. Matching on the generic "raop_sink"
+# substring alone would non-deterministically pick whichever sink happens to
+# be listed first — including someone's laptop. Each entry below matches its
+# device's specific hostname instead, which is stable across reboots because
+# it comes from mDNS, not from IP/vol/db state.
+[[routes]]
+id = "airplay"
+label = "AirPlay"
+icon = "airplay"
+mpd_output = "Network"
+pw_sink = "raop_sink.SoundTouch"   # Bose SoundTouch 30 — has the dedicated Stream Deck key
+
+# Second speaker (Arylic 4stream). No dedicated Stream Deck key — only 3
+# route slots exist on the panel now that the 4th became the Video key.
+# Reachable today via the TourBox's existing cycle_output (knob click) /
+# cycle_output_back (shift+knob click), which walk the WHOLE routes list,
+# not just the ones with a Stream Deck key. Swap this with one of the 3
+# above if you'd rather have it on the panel and cycle to SoundTouch instead.
+[[routes]]
+id = "airplay_arylic"
+label = "Arylic"
+icon = "airplay"
+mpd_output = "Network"
+pw_sink = "raop_sink.Arylic"
+
+
+# =============================================================================
+# Graceful shutdown
+# =============================================================================
+[power]
+# GPIO pin (BCM numbering) wired to a momentary button -> GND.
+# Set enabled = false if you are not fitting a button.
+enabled = false
+gpio_pin = 3
+hold_seconds = 2.0
+# Also allow shutdown from a TourBox chord (see keymap.toml action "shutdown").
+confirm_with_streamdeck = true
+
+
+# =============================================================================
+# Delete key (Stream Deck key 23, where Stop used to be)
+# =============================================================================
+# mode:
+#   "queue"      remove from the play queue only — the file is NOT touched
+#   "trash"      move the file into trash_dir — recoverable until you empty it
+#   "permanent"  unlink the file — NOT RECOVERABLE
+#
+# confirm:
+#   "none"       acts on the first press
+#   "two_step"   first press arms, second within confirm_seconds commits
+#   "long_press" hold confirm_seconds to commit
+#
+# Currently: trash mode, two-step confirm (press once to arm, press again
+# within confirm_seconds to actually delete — same dance as Shutdown).
+# Applies to BOTH the music page's Delete key and the video page's Delete
+# key at the identical cell (2,7) — one setting, same confirm behaviour on
+# either page. Requested specifically after a stray/accidental press risk
+# with "none" (act on first press) felt too easy to trigger by mistake.
+#
+# Worth knowing where this key sits: 23 is directly beside next-track (21) and
+# next-album (22), the two keys you reach for most while listening. If you ever
+# lose a track to a stray tap, "trash" costs nothing at press time and makes it
+# recoverable — change one word below.
+[delete]
+enabled = true
+mode = "trash"
+confirm = "two_step"
+confirm_seconds = 3.0
+trash_dir = "/home/rpi/Music-trash"
+# Every deletion is appended here with a timestamp. This is the ONLY record of
+# what a permanent delete removed.
+log_path = "/home/rpi/deleted-tracks.log"
+# Hard safety rail: nothing outside this directory is ever touched, whatever
+# URI MPD reports.
+music_dir = "/home/rpi/Music"
+
+
+# =============================================================================
+# Headless playback behaviour
+# =============================================================================
+[playback]
+# Load the next library folder automatically when the queue runs dry, so music
+# plays continuously from one folder to the next with no screen and no input.
+auto_advance_folders = true
+
+# Force MPD's `consume` and `single` modes OFF at startup, and again whenever
+# they come back on.
+#
+# Both are one Stream Deck key press away and both silently break headless
+# playback in ways that look like controller bugs:
+#   consume  removes each track from the queue as it plays. The queue drains,
+#            so playback stops early — AND `previous` has nothing left to go
+#            back to, so it appears to just restart the current track.
+#   single   stops after every single track.
+force_consume_off = true
+
+# Seconds MPD cross-mixes the end of one song into the start of the next.
+# Applied via MPD's own `crossfade` command at daemon startup. Only covers
+# AUTOMATIC transitions (queue advancing on its own) — MPD cannot crossfade a
+# manual skip at all (a long-standing, still-open MPD limitation). 0 disables.
+crossfade_seconds = 10
+
+# The TourBox's Knob click toggles crossfade between crossfade_seconds above
+# and this value (shift+Knob click still cycles output routes, its old job).
+crossfade_seconds_alt = 5
+
+# A manual next/previous can't use MPD's crossfade (see above), so instead it
+# gets a quick software volume duck: fades down, changes track, fades back
+# up. Total seconds for that duck (half down, half up). 0 = instant cut, the
+# old behaviour.
+skip_fade_seconds = 1.2
+
+# Route forced on at startup if MPD comes up with NO output enabled at all
+# (its state_file can persist a stale/blank "everything disabled" state
+# across a restart — found live, silently killed all audio with no error).
+# Must match one of the [[routes]] ids below.
+#
+# "bt" on this profile, not "local" — rpi-touch has no USB DAC (aplay -l
+# shows only the two onboard HDMI outputs), so Local is disabled in
+# mpd.conf.touch. Boots straight to the Bose QC45 headphones already paired
+# on the original Pi; re-pair/trust them on this Pi too (bin/bt-connect).
+default_route_id = "bt"
+
+
+# =============================================================================
+# Video / karaoke mode (.skp playback)
+# =============================================================================
+# .skp files are demuxed and streamed on the fly -- never converted, never
+# copied. See docs/VIDEO-MODE.md. mpv itself runs as its own systemd service
+# (video-mpv.service), always up, idle, holding the HDMI output.
+[video]
+enabled = true
+library_dir = "/home/rpi/Video"
+mpv_socket = "/run/rpi-player-video/mpv.sock"
+timeout = 5.0
+# Load the next .skp automatically when one finishes, same idea as
+# [playback].auto_advance_folders in Music mode — video mode should play
+# straight through the whole library, not stop after one file. Wraps back to
+# the first entry after the last. See player/video_continuous.py.
+auto_advance = true
+# Extensions the library scan indexes (case-insensitive, subfolders
+# included). Not .skp-only — a mixed library of .skp karaoke files
+# alongside plain video is expected. .skp is the one format that needs the
+# custom subfile demux at load time (player/video.py's load_and_play); every
+# other extension here just plays as an ordinary file.
+extensions = [".skp", ".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm"]
+local_audio_device = "hw:CARD=S3,DEV=0"
+
+
+# =============================================================================
+# Touch UI (rpi-touch profile only — the whole reason this profile exists)
+# =============================================================================
+# player/touch_daemon.py: reads the DSI panel's raw evdev input, renders the
+# wireframe overlay (player/touchui/render.py) and pushes it into mpv via
+# `overlay-add` (see video-mpv.service — mpv stays up, holding the DRM
+# output, whether or not anything is loaded). Button geometry and hit-testing
+# both come from player/touchui/layout.py so drawing and touch can never
+# drift apart.
+[touch]
+enabled = true
+
+# Leave blank to auto-detect: touch_daemon.py scans evdev.list_devices(),
+# logs every candidate's name + capabilities at INFO on startup, and prefers
+# a multitouch (ABS_MT_POSITION_X/Y) device over a single-touch one. Set this
+# explicitly (e.g. "/dev/input/event4") once you've seen the real device name
+# in `journalctl -u touch-ui-player` and want to pin it — a second USB input
+# device (a keyboard for debugging, say) showing up between boots could
+# otherwise change which /dev/input/eventN node is the panel.
+device = ""
+
+# This Pi 5's drm-rp1-dsi + tc358762 bridge driver does not honor the
+# standard KMS `rotate` connector property — confirmed live: a corrected
+# `video=DSI-1:800x480@60,rotate=180` kernel cmdline entry had no visible
+# effect after a full reboot. Rotation is therefore handled entirely in this
+# application: render.py rotates the finished overlay canvas 180 degrees
+# before handing it to mpv, and touch_daemon.py rotates each raw touch
+# coordinate 180 degrees before hit-testing against touchui/layout.py's
+# button rects. See touchui/layout.py's module docstring for the exact
+# contract. Set false if the panel is ever remounted right-side up.
+rotate_180 = true
+
+# Where the rendered BGRA bitmap is written before each overlay-add call.
+# Deliberately inside video-mpv.service's OWN RuntimeDirectory
+# (rpi-player-video), not the shared /run/rpi-player used by
+# tourbox-player/streamdeck-player — see touch-ui-player.service's long
+# comment on the documented multi-owner RuntimeDirectory teardown race that
+# bit this project once already (mpv.sock vanishing out from under mpv on an
+# unrelated service restart). touch-ui-player only ever writes into this
+# directory; video-mpv.service is the one that creates and owns it.
+overlay_path = "/run/rpi-player-video/overlay.bgra"
+
+# mpv overlay-add's id parameter. Arbitrary but must not collide with any
+# other overlay id this project ever adds — there is currently only this one.
+overlay_id = 90210
+
+# Re-render on this interval even with no touch input, so the elapsed-time
+# readout and scrub bar keep advancing during playback (same idea as
+# streamdeck's tick_seconds for its progress key).
+tick_seconds = 1.0

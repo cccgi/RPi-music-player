@@ -142,12 +142,12 @@ dpad_left    = "seek_back_fast"    # -60s
 dpad_right   = "seek_forward_fast" # +60s
 knob_click   = "cycle_output_back"  # only route-cycle control left on the TourBox now
 scroll_click = "toggle_repeat"
+top          = "delete_current"    # Side + Top = delete current track
 
 [layers.track.double]
 # Tour has NO single-press binding, so a lone press does nothing and the
 # double fires immediately with no added latency anywhere on the device.
-# delete_current already advances to the next track before removing the file.
-tour = "delete_current"
+tour = "curate_to_favorites"       # double-click Tour = move to Favorites/
 
 
 # ===========================================================================
@@ -168,6 +168,7 @@ dpad_right = "seek_forward_fast"   # +30s
 [layers.folder.shift]
 c1         = "prev_album"
 c2         = "next_album"
+top        = "delete_current"      # Side + Top = delete current track
 
 
 # ===========================================================================
@@ -235,9 +236,10 @@ dpad_up      = "noop"
 dpad_down    = "noop"
 knob_click   = "noop"
 scroll_click = "noop"
+top          = "video_delete_current"  # Side + Top = delete current video
 
 [layers.video.double]
-tour = "video_delete_current"
+tour = "video_curate_to_favorites"     # double-click Tour = move video to Favorites/
 
 
 # ===========================================================================

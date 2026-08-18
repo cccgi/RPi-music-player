@@ -275,6 +275,18 @@ sed "s/subject.user == \"rpi\"/subject.user == \"$SERVICE_USER\"/" \
     "$SRC/system/polkit/52-rpi-player-network.rules" \
     > /etc/polkit-1/rules.d/52-rpi-player-network.rules
 chmod 0644 /etc/polkit-1/rules.d/52-rpi-player-network.rules
+
+# ---------------------------------------------------------------------------
+log "Installing polkit video-mpv-restart rule"
+# ---------------------------------------------------------------------------
+# Same reasoning again, for the video page's "Reinit" key (actions.py's
+# video_reinit) -- `systemctl restart video-mpv.service` needs this or it
+# fails silently the same way the other four did before their rules
+# existed. Scoped to video-mpv.service only.
+sed "s/subject.user == \"rpi\"/subject.user == \"$SERVICE_USER\"/" \
+    "$SRC/system/polkit/53-rpi-player-video-mpv.rules" \
+    > /etc/polkit-1/rules.d/53-rpi-player-video-mpv.rules
+chmod 0644 /etc/polkit-1/rules.d/53-rpi-player-video-mpv.rules
 systemctl restart polkit 2>/dev/null || true
 
 # ---------------------------------------------------------------------------

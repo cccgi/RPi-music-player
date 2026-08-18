@@ -369,7 +369,7 @@ class VideoCommander:
             return {
                 "playing": False, "paused": True, "title": "", "singer": "",
                 "elapsed": 0.0, "duration": 0.0, "track_label": "", "track_count": 0,
-                "loaded": False,
+                "loaded": False, "path": "",
             }
         track_list = self.get("track-list") or []
         audio_tracks = [t for t in track_list if t.get("type") == "audio"]
@@ -389,6 +389,11 @@ class VideoCommander:
             # moment mid-transition. Used by both daemons to decide whether
             # the panel/layer should auto-follow into video mode.
             "loaded": True,
+            # mpv's own authoritative idea of what's loaded right now — the
+            # ONE thing every process sharing this mpv instance can trust,
+            # the same role MPD itself plays for music mode. See
+            # streamdeck_daemon._collect_video_state's resync using this.
+            "path": media_path,
         }
 
 
@@ -534,6 +539,21 @@ class VideoLibrary:
             return None
         return self.select(self._index - 1)
 
+    def select_by_path(self, path: str) -> VideoEntry | None:
+        """Find and select the entry whose path matches ``path`` exactly.
+
+        Needed by the page-2 grid browser (VideoGridBrowser): its rows come
+        from a live directory listing (``list_dir``, below), not from this
+        class's own pre-scanned ``entries()`` order, so it has no index to
+        hand back the way the "up next" slots (built directly from
+        ``entries()``, see streamdeck_daemon._video_window) do — it can only
+        identify what was picked by path.
+        """
+        for i, entry in enumerate(self._entries):
+            if entry.path == path:
+                return self.select(i)
+        return None
+
     # -- subfolder access -----------------------------------------------------
 
     def top_folders(self) -> list[str]:
@@ -566,6 +586,48 @@ class VideoLibrary:
                 return i
         return None
 
+    def list_dir(self, rel_path: str = "") -> list[tuple[str, bool, str]]:
+        """Immediate children of ``rel_path`` (relative to the library
+        root): ``(name, is_dir, absolute_path)`` tuples, directories sorted
+        before files, each sublist case-insensitive by name — same
+        convention as the music library browser (see
+        streamdeck.browser.LibraryBrowser). Files are filtered to
+        ``self._extensions`` (the same list ``rescan()`` uses — no second,
+        separately-maintained extension list); directories are listed
+        unconditionally, since a subfolder might hold indexed videos
+        several levels further down even if it has none directly in it.
+
+        Powers the video page's page-2 grid browser (VideoGridBrowser).
+        Deliberately a live ``os.scandir``, not a lookup against
+        ``self._entries`` — a folder created (or a file dropped in) since
+        the last ``rescan()`` should still be browsable immediately,
+        without requiring a rescan first, since renaming/moving files is
+        exactly what browsing here is often used for.
+        """
+        base = os.path.join(self._root, rel_path) if rel_path else self._root
+        if not os.path.isdir(base):
+            return []
+        dirs: list[str] = []
+        files: list[str] = []
+        try:
+            with os.scandir(base) as it:
+                for entry in it:
+                    if entry.is_dir():
+                        dirs.append(entry.name)
+                    elif entry.is_file() and entry.name.lower().endswith(self._extensions):
+                        files.append(entry.name)
+        except OSError as exc:
+            LOG.warning("video list_dir failed for %s: %s", base, exc)
+            return []
+        dirs.sort(key=str.lower)
+        files.sort(key=str.lower)
+        result: list[tuple[str, bool, str]] = []
+        for name in dirs:
+            result.append((name, True, os.path.join(base, name)))
+        for name in files:
+            result.append((name, False, os.path.join(base, name)))
+        return result
+
     # -- resume position -----------------------------------------------------
 
     def remember_position(self, path: str, elapsed: float, duration: float) -> None:
@@ -592,6 +654,15 @@ class VideoLibrary:
         ``remember_position``.
         """
         return self._positions.pop(path, None)
+
+    def forget_position(self, path: str) -> None:
+        """Drop any saved resume position for ``path`` outright, with no
+        replacement — used when the file at that path is about to stop
+        existing there at all (video_curate_current moving it into a
+        Curated/ subfolder), so a stale resume entry keyed by the OLD path
+        doesn't linger forever pointing at nothing.
+        """
+        self._positions.pop(path, None)
 
 
 def load_and_play(commander: VideoCommander, entry: VideoEntry,

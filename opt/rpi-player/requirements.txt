@@ -23,5 +23,13 @@ streamdeck==0.9.6
 # --- Imaging ----------------------------------------------------------------
 Pillow==10.4.0
 
+# --- Touch UI (rpi-touch profile only) --------------------------------------
+# Raw evdev access to the DSI touch panel's /dev/input/eventN node — reads
+# multitouch ABS_MT_POSITION_X/Y or single-touch ABS_X/Y + BTN_TOUCH
+# directly, no X11/Wayland input stack involved (see touch_daemon.py).
+# Harmless to install on the rpi-audio profile too; touch-ui-player.service
+# is simply never enabled there.
+evdev==1.7.1
+
 # NOTE: TOML parsing uses the stdlib `tomllib` (Python 3.11+). Debian Trixie
 # ships Python 3.13, so no external TOML dependency is needed.

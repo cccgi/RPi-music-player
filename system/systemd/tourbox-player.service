@@ -107,7 +107,13 @@ ProtectHome=read-only
 # and needs the same write access there that music's delete has under
 # /home/rpi/Music. Keep in sync with config.toml's [delete] trash_dir/
 # log_path/music_dir and [video] library_dir if you ever change them.
-ReadWritePaths=-/run/rpi-player -/run/user/1000 /home/rpi/Music /home/rpi/Music-trash /home/rpi/deleted-tracks.log /home/rpi/Video
+#
+# Widened to the whole home directory for the same reason documented in
+# streamdeck-player.service: the Internal/USB storage-source toggle needs to
+# unlink/recreate the /home/rpi/Music and /home/rpi/Video symlinks
+# themselves (a write to their PARENT directory), which no list of child
+# paths alone can grant.
+ReadWritePaths=-/run/rpi-player -/run/user/1000 /home/rpi
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

@@ -289,9 +289,17 @@ class Decoder:
             self._modifier_used = True
 
         # --- layer toggle ---------------------------------------------------
-        # Switches layer and dispatches nothing else. Handled before any
-        # binding lookup so it cannot be shadowed by a stray binding.
+        # Normally switches layer and dispatches nothing else. BUT if the
+        # modifier (Side) is held at the same time, treat it as a shiftable
+        # button so Side+Top can carry its own action (e.g. delete_current)
+        # without cycling the layer.
         if name == self._toggle_name:
+            if self._modifier_down:
+                self._modifier_used = True
+                action = self._binding("shift", name)
+                if action:
+                    self._held[name] = _HeldButton(spec=spec, pressed_at=now)
+                    return [self._event(EventKind.PRESS, name, action, shifted=True)]
             self._held[name] = _HeldButton(spec=spec, pressed_at=now)
             index = self.cycle_layer()
             LOG.debug("layer -> %d (%s)", index, self.layer_label)

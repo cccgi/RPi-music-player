@@ -219,6 +219,33 @@ class PowerConfig:
 
 
 @dataclass(frozen=True)
+class TouchConfig:
+    """rpi-touch profile only — the 7in DSI touchscreen overlay UI.
+
+    See player/touch_daemon.py and player/touchui/ (layout.py, render.py).
+    Absent/false on the original rpi-audio profile's config.toml.
+    """
+
+    enabled: bool = False
+    # Explicit /dev/input/eventN path, or "" to auto-detect (see
+    # touch_daemon.find_touch_device).
+    device: str = ""
+    # This Pi 5's DSI bridge driver does not honor the KMS rotate connector
+    # property (confirmed live — see touchui/layout.py's docstring), so
+    # rotation is done entirely in software: render.py rotates the finished
+    # overlay canvas, touch_daemon.py rotates raw touch coordinates before
+    # hit-testing.
+    rotate_180: bool = True
+    # Inside video-mpv.service's OWN RuntimeDirectory (rpi-player-video),
+    # deliberately not the shared /run/rpi-player dir — see
+    # touch-ui-player.service's comment on the multi-owner RuntimeDirectory
+    # teardown race this project already hit once.
+    overlay_path: str = "/run/rpi-player-video/overlay.bgra"
+    overlay_id: int = 90210
+    tick_seconds: float = 1.0
+
+
+@dataclass(frozen=True)
 class Config:
     mpd: MpdConfig
     ipc: IpcConfig
@@ -229,6 +256,7 @@ class Config:
     delete: DeleteConfig
     playback: PlaybackConfig
     video: VideoConfig
+    touch: TouchConfig
     log_level: str = "INFO"
 
     def route_by_id(self, route_id: str) -> Route | None:
@@ -471,6 +499,16 @@ def load_config(path: Path | None = None) -> Config:
         local_audio_device=video_raw.get("local_audio_device", "hw:CARD=S3,DEV=0"),
     )
 
+    touch_raw = raw.get("touch", {})
+    touch = TouchConfig(
+        enabled=bool(touch_raw.get("enabled", False)),
+        device=touch_raw.get("device", ""),
+        rotate_180=bool(touch_raw.get("rotate_180", True)),
+        overlay_path=touch_raw.get("overlay_path", "/run/rpi-player-video/overlay.bgra"),
+        overlay_id=int(touch_raw.get("overlay_id", 90210)),
+        tick_seconds=float(touch_raw.get("tick_seconds", 1.0)),
+    )
+
     return Config(
         mpd=mpd,
         ipc=ipc,
@@ -481,6 +519,7 @@ def load_config(path: Path | None = None) -> Config:
         delete=delete,
         playback=playback,
         video=video,
+        touch=touch,
         log_level=raw.get("log", {}).get("level", "INFO"),
     )
 

@@ -65,21 +65,49 @@ LAYOUT: dict[int, KeyDef] = {
     # levels deep is one tap away from a fresh top-level listing to descend
     # from again, rather than repeated presses of Back.
     index(0, 5): KeyDef("browse_root", label="Library"),
-    index(0, 6): KeyDef("queue_position"),
+    # Was queue_position (a bare "2 of 5"-style playlist position). Replaced
+    # with a compact volume gauge — see KeyRenderer.volume_bar — so a
+    # volume/mute control lives in the top row where a glance already goes,
+    # freeing (1,1) below for Curate. toggle_mute's action moved here
+    # verbatim; the action itself is unchanged, only which key triggers it.
+    index(0, 6): KeyDef("volume_bar", action="toggle_mute"),
     index(0, 7): KeyDef("bitrate"),          # also the toast slot
 
     # -----------------------------------------------------------------------
     # Row 1 — telemetry and modes
     # -----------------------------------------------------------------------
     index(1, 0): KeyDef("progress", action="seek_to_start"),
-    index(1, 1): KeyDef("volume", action="toggle_mute"),
+    # Was the old number-plus-mute-toggle "volume" tile (superseded by
+    # volume_bar at (0,6) above, which now owns toggle_mute). Repurposed for
+    # curate_current: move the currently playing file into a Curated/
+    # subfolder alongside it, one tap, without touching playback.
+    index(1, 1): KeyDef("glyph", action="curate_to_favorites", label="Curate",
+                        params={"symbol": "heart", "caption": "Curate", "colour": "#FF3B30"}),
     index(1, 2): KeyDef("glyph", action="volume_down", label="Vol -",
                         params={"symbol": "vol_down", "caption": "Vol −"}),
     index(1, 3): KeyDef("glyph", action="volume_up", label="Vol +",
                         params={"symbol": "vol_up", "caption": "Vol +"}),
-    index(1, 4): KeyDef("mode_random", action="toggle_random"),
-    index(1, 5): KeyDef("mode_repeat", action="toggle_repeat"),
-    index(1, 6): KeyDef("mode_single", action="toggle_single"),
+    # Single (repeat-current-song-only) was its own button here — removed
+    # and folded into Repeat's 3-state cycle instead (see
+    # actions.cycle_repeat_mode: Off -> Folder -> Song -> Off), since it was
+    # really just a stronger repeat mode, not an independent concept.
+    # Reflow, at the user's request: Repeat moved into Single's old slot
+    # (1,6), Shuffle moved into Repeat's old slot (1,5), and Single's
+    # vacated original slot (1,4) is now a plain +30s seek-forward scrub —
+    # reusing the existing seek_forward_fast action/ffwd3 glyph (already
+    # used on the video page), just newly exposed on music page 1 too.
+    index(1, 4): KeyDef("glyph", action="seek_forward_fast",
+                        params={"symbol": "ffwd3", "caption_fmt": "+{seek_fast}s"}),
+    # Shuffle: 3-state cycle (see actions.cycle_shuffle_mode) — Off ->
+    # Folder (shuffle whatever's currently queued, i.e. the current folder
+    # under this player's normal browsing convention) -> All (replace the
+    # queue with the ENTIRE current storage source's library and shuffle
+    # across all of it) -> Off.
+    index(1, 5): KeyDef("mode_shuffle3", action="cycle_shuffle_mode"),
+    # Repeat: 3-state cycle (see actions.cycle_repeat_mode) — Off -> Folder
+    # (loop the current queue/folder) -> Song (repeat just the current
+    # track) -> Off.
+    index(1, 6): KeyDef("mode_repeat3", action="cycle_repeat_mode"),
     index(1, 7): KeyDef("mode_consume", action="toggle_consume"),
 
     # -----------------------------------------------------------------------
@@ -116,18 +144,36 @@ LAYOUT: dict[int, KeyDef] = {
     # id="airplay_arylic") still exists and still works — it just doesn't
     # get a dedicated key; see config.toml for how to reach it via the
     # TourBox's cycle_output instead.
+    # Was the first of 3 dynamic route slots (always "local"/USB-DAC, since
+    # config.toml lists routes local/bt/airplay/airplay_arylic in that
+    # order). Local moved to a fixed key on page 2 (LAYOUT_BROWSE index(3,7))
+    # instead, freeing this cell as the entry point into the new page-2
+    # browser — mirrors the video page's identical relocation at the same
+    # cell (see LAYOUT_VIDEO index(3,0)).
+    index(3, 0): KeyDef("page2_enter", action="enter_page2", label="Next Page"),
     index(3, 3): KeyDef("video_mode_toggle", action="enter_video_mode", label="Video"),
     # Browser navigation, on the two keys that were previously blank.
     index(3, 4): KeyDef("browse_back"),
-    index(3, 5): KeyDef("label", action="update_database", label="Scan",
-                        params={"sub": "library"}),
+    # Was the "Scan" key (update_database) — relocated verbatim to page 2's
+    # bottom row (see LAYOUT_BROWSE index(3,5)) to make room here for the
+    # Internal/USB storage-source toggle, which needs a page-1 key since
+    # it's reached far more often than a manual library rescan.
+    # Label is "Storage" (the tile's fixed title), not "USB" -- the sub-line
+    # underneath is the LIVE current source (Internal/USB/Scanning...), so
+    # "USB" as the fixed title made this read as "USB / Internal" or
+    # "USB / USB", which is nonsensical (reported live: "doesn't make
+    # sense"). It has always been a toggle between Internal and USB, one
+    # button, not two — "Storage" as the title makes that unambiguous.
+    index(3, 5): KeyDef("label", action="toggle_storage_source", label="Storage"),
     index(3, 6): KeyDef("browse_page"),
     index(3, 7): KeyDef("power", action="shutdown", label="Power"),
 }
 
-# Slots the daemon fills with one route key each, in config order. Only 3
-# now — see the comment above index(3, 3) in LAYOUT for where the 4th went.
-ROUTE_SLOTS = [index(3, 0), index(3, 1), index(3, 2)]
+# Slots the daemon fills with one route key each, in config order (with
+# "local" filtered out first — see streamdeck_daemon._bind_route_keys).
+# Only 2 now: index(3, 0) became the page-2 entry key below, and Local
+# itself moved to page 2's fixed Local route key (LAYOUT_BROWSE index(3,7)).
+ROUTE_SLOTS = [index(3, 1), index(3, 2)]
 
 # Where a transient toast is shown. Overlays whatever normally lives here for
 # a couple of seconds, then reverts.
@@ -184,8 +230,15 @@ LAYOUT_VIDEO: dict[int, KeyDef] = {
     index(0, 2): KeyDef("video_entry", params={"slot": 2}),
     index(0, 3): KeyDef("video_entry", params={"slot": 3}),
     index(0, 4): KeyDef("now_playing_title", action="video_play_pause"),
-    index(0, 5): KeyDef("audio_track", action="switch_track", label="Track"),
-    index(0, 6): KeyDef("queue_position"),
+    # `label` here is unused -- streamdeck_daemon's "audio_track" render
+    # branch computes its own title live ("Vocal"/"Sing"/"Track") from
+    # which track is actually active, so the button's main text changes
+    # with state instead of staying a fixed "Track" caption.
+    index(0, 5): KeyDef("audio_track", action="switch_track"),
+    # Mirrors LAYOUT's identical relocation at the same cell — see that
+    # comment above index(0, 6) for the full reasoning. mpv's volume (not
+    # MPD's) is what this reads/toggles here.
+    index(0, 6): KeyDef("volume_bar", action="video_toggle_mute"),
     # Top-right: turn the Stream Deck's own backlight off to save power on
     # the road, at the user's specific request for "top right tile". This
     # only touches deck.set_brightness() -- the USB HID connection stays up
@@ -202,7 +255,10 @@ LAYOUT_VIDEO: dict[int, KeyDef] = {
     # separate from MPD's (paused/idle the whole time video plays) — there
     # was previously no way to change video volume from the panel at all.
     index(1, 0): KeyDef("progress"),
-    index(1, 1): KeyDef("volume", action="video_toggle_mute"),
+    # Mirrors LAYOUT's identical relocation at the same cell — video's own
+    # Curate, moving the currently-playing video into a Curated/ subfolder.
+    index(1, 1): KeyDef("glyph", action="video_curate_to_favorites", label="Curate",
+                        params={"symbol": "heart", "caption": "Curate", "colour": "#FF3B30"}),
     index(1, 2): KeyDef("glyph", action="video_volume_down", label="Vol -",
                         params={"symbol": "vol_down", "caption": "Vol −"}),
     index(1, 3): KeyDef("glyph", action="video_volume_up", label="Vol +",
@@ -275,8 +331,11 @@ LAYOUT_VIDEO: dict[int, KeyDef] = {
     # (streamdeck_daemon._enter_bt_picker / _enter_airplay_picker) instead
     # of dispatching these actions directly — see the interception in
     # _on_key.
-    index(3, 0): KeyDef("video_route", action="video_route_local",
-                        params={"route_id": "local"}),
+    # Was the fixed Local/USB-DAC route key — relocated to page 2's fixed
+    # Local key (LAYOUT_VIDEO_BROWSE index(3,7), same kind/action, unchanged)
+    # to make room here for the page-2 entry point, mirroring LAYOUT's
+    # identical relocation at the same cell.
+    index(3, 0): KeyDef("page2_enter", action="enter_video_page2", label="Next Page"),
     index(3, 1): KeyDef("video_route", action="video_route_bt",
                         params={"route_id": "bt"}),
     index(3, 2): KeyDef("video_route", action="video_route_airplay",
@@ -286,8 +345,10 @@ LAYOUT_VIDEO: dict[int, KeyDef] = {
     index(3, 3): KeyDef("video_back", action="exit_video_mode", label="Music"),
     index(3, 4): KeyDef("glyph", action="video_browse_prev",
                         params={"symbol": "rew", "caption": "Songs"}),
-    index(3, 5): KeyDef("label", action="video_rescan", label="Scan",
-                        params={"sub": "video"}),
+    # Was "Scan" (video_rescan) — relocated verbatim to page 2's bottom row
+    # (LAYOUT_VIDEO_BROWSE index(3,5)), mirroring the music page's identical
+    # move, to make room here for the Internal/USB storage-source toggle.
+    index(3, 5): KeyDef("label", action="video_toggle_storage_source", label="Storage"),
     index(3, 6): KeyDef("glyph", action="video_browse_next",
                         params={"symbol": "ffwd", "caption": "Songs"}),
     # Same key, same action name, as the music page's Shutdown (3,7) — the
@@ -299,6 +360,172 @@ LAYOUT_VIDEO: dict[int, KeyDef] = {
 
 def video_key_def(key: int) -> KeyDef | None:
     return LAYOUT_VIDEO.get(key)
+
+
+# ---------------------------------------------------------------------------
+# "Page 2" — unified full-page folder/file browser grids, one per mode.
+# ---------------------------------------------------------------------------
+# Both LAYOUT_BROWSE (music) and LAYOUT_VIDEO_BROWSE (video) share the exact
+# same geometry across rows 0-3:
+#
+#   * Slot 0 (physical index(0, 0)) is ALWAYS the ".." parent-navigation
+#     slot — inert/blank at the library root, since there is no parent to
+#     go to.
+#   * Slots 1-19 (the rest of row 0, all of row 1, and the middle 4 of row
+#     2 — index(2,2) through index(2,5)) show up to 19 entries of the
+#     current directory: subfolders sorted before files, each sublist
+#     case-insensitive by name — same convention as LibraryBrowser. Row 2's
+#     content span was shrunk from 6 slots to 4 (index(2,1) and index(2,6)
+#     freed up) to make room for Curate/Delete right on the browse grid
+#     itself, at the user's request, rather than only reachable from page 1.
+#   * index(2, 0) and index(2, 7) are fixed paging keys (page back/forward
+#     through the entry window, wrapping at the ends), rendered in a
+#     visually distinct colour (see streamdeck_daemon._render_grid_key) so
+#     they read as paging controls rather than folders/files.
+#   * index(2, 1) is Curate (a red heart, same "glyph" kind/params as page
+#     1's Curate key) and index(2, 6) is Delete (the same two-step-confirm
+#     "delete" kind page 1 uses at (2,7)) — both fall through to
+#     streamdeck_daemon._render_key/_on_key's EXISTING generic kind
+#     handling (see _render_grid_key's fallback and _on_key's delete
+#     special-casing for PAGE_MUSIC_BROWSE/PAGE_VIDEO_BROWSE) rather than
+#     duplicating that logic here.
+#   * index(3, 3), index(3, 4), index(3, 5) — previously blank — are Play/
+#     Pause, Seek +15s, and Next Song, copied from the page-1 transport row
+#     so the core transport is reachable without leaving the browse grid.
+#     Next sits at (3, 5) rather than (3, 6) so it's adjacent to Seek +15s
+#     (the two keys most often pressed back-to-back) — Scan moved to
+#     (3, 6), next to Local, which is reached far less often.
+#
+# The backing state (MusicGridBrowser / VideoGridBrowser, in
+# streamdeck.browser) and the daemon's render/press handling
+# (_render_grid_key / _on_grid_key_press) are shared between both pages —
+# only which browser instance and which of these two layout dicts gets
+# passed in differs.
+GRID_SLOT_KEYS: list[int] = (
+    [index(0, c) for c in range(COLUMNS)]
+    + [index(1, c) for c in range(COLUMNS)]
+    + [index(2, c) for c in range(2, COLUMNS - 2)]
+)
+# 20 physical slots total: slot 0 is "..", the remaining 19 are content.
+GRID_CONTENT_SLOTS = len(GRID_SLOT_KEYS) - 1
+
+GRID_PAGE_BACK_KEY = index(2, 0)
+GRID_PAGE_FORWARD_KEY = index(2, 7)
+
+
+def _build_grid_layout(
+    *, back_action: str, back_label: str,
+    scan_action: str, scan_label: str, scan_sub: str,
+    route_kind: str, route_action: str,
+    storage_internal_action: str, storage_usb_action: str,
+    curate_action: str, delete_action: str,
+    play_pause_action: str, seek_forward_action: str, next_action: str,
+) -> dict[int, KeyDef]:
+    """Shared geometry-builder for LAYOUT_BROWSE/LAYOUT_VIDEO_BROWSE — only
+    the bottom row's close/scan/route/storage keys and the curate/delete/
+    transport actions differ between the two pages.
+    """
+    grid: dict[int, KeyDef] = {}
+    for slot, key in enumerate(GRID_SLOT_KEYS):
+        if slot == 0:
+            grid[key] = KeyDef("grid_updir")
+        else:
+            grid[key] = KeyDef("grid_entry", params={"slot": slot - 1})
+
+    grid[GRID_PAGE_BACK_KEY] = KeyDef("grid_page", action="grid_page_back",
+                                      params={"symbol": "rew", "direction": -1})
+    grid[GRID_PAGE_FORWARD_KEY] = KeyDef("grid_page", action="grid_page_forward",
+                                         params={"symbol": "ffwd", "direction": 1})
+
+    # Curate/Delete — same render kinds page 1 already uses at these
+    # actions ("glyph" with a static red-heart colour, and the two-step-
+    # confirm "delete" kind), so streamdeck_daemon needs no NEW rendering
+    # logic, just a fallthrough to the existing generic handler.
+    grid[index(2, 1)] = KeyDef("glyph", action=curate_action, label="Curate",
+                               params={"symbol": "heart", "caption": "Curate",
+                                       "colour": "#FF3B30"})
+    grid[index(2, 6)] = KeyDef("delete", action=delete_action)
+
+    grid[index(3, 0)] = KeyDef("video_back", action=back_action, label=back_label)
+    # Direct Internal/USB jump keys -- unlike page 1's single toggle button,
+    # these set an EXPLICIT source (see actions.py's set_storage_internal/
+    # set_storage_usb) and reset the grid straight to that source's root, so
+    # "press USB" always means "show me USB, starting from the top" no
+    # matter what was on screen before.
+    grid[index(3, 1)] = KeyDef("storage_select", action=storage_internal_action,
+                               label="Internal", params={"target": "internal"})
+    grid[index(3, 2)] = KeyDef("storage_select", action=storage_usb_action,
+                               label="USB", params={"target": "usb"})
+    # Core transport, copied from page 1's row 2 -- reachable without
+    # leaving the browse grid. (3,7) stays Local. Scan and Next were swapped
+    # from their original (3,5)/(3,6) placement at the user's request, so
+    # Next now sits right next to Seek +15s (3,4) -- the two keys most often
+    # pressed back-to-back while skipping through a listing -- and Scan
+    # moved next to Local (3,7), which is reached far less often.
+    grid[index(3, 3)] = KeyDef("playpause", action=play_pause_action)
+    grid[index(3, 4)] = KeyDef("glyph", action=seek_forward_action,
+                               params={"symbol": "ffwd", "caption_fmt": "+{seek}s"})
+    grid[index(3, 5)] = KeyDef("glyph", action=next_action, params={"symbol": "next"})
+    grid[index(3, 6)] = KeyDef("label", action=scan_action, label=scan_label,
+                               params={"sub": scan_sub})
+    grid[index(3, 7)] = KeyDef(route_kind, action=route_action,
+                               params={"route_id": "local"})
+    return grid
+
+
+# Music page 2 — reuses "video_back" as a generic labeled-back-tile kind
+# (nothing video-specific about how it renders, same as the AirPlay/BT
+# pickers' own Back keys) and the new "route_fixed" kind for the relocated
+# Local route key (streamdeck_daemon mirrors "video_route"'s rendering for
+# it against ctx.router, which is the same OutputRouter either way).
+LAYOUT_BROWSE: dict[int, KeyDef] = _build_grid_layout(
+    back_action="close_page2", back_label="Prev Page",
+    scan_action="update_database", scan_label="Scan", scan_sub="library",
+    route_kind="route_fixed", route_action="route_to_local",
+    storage_internal_action="set_storage_internal", storage_usb_action="set_storage_usb",
+    curate_action="curate_to_favorites", delete_action="delete_current",
+    play_pause_action="toggle_pause", seek_forward_action="seek_forward",
+    next_action="next_track",
+)
+
+
+def browse_grid_key_def(key: int) -> KeyDef | None:
+    return LAYOUT_BROWSE.get(key)
+
+
+# Video page 2 — the bottom-right Local route key is the EXACT existing
+# "video_route"/"video_route_local" kind+action, just relocated here.
+LAYOUT_VIDEO_BROWSE: dict[int, KeyDef] = _build_grid_layout(
+    back_action="close_video_page2", back_label="Prev Page",
+    scan_action="video_rescan", scan_label="Scan", scan_sub="video",
+    route_kind="video_route", route_action="video_route_local",
+    storage_internal_action="video_set_storage_internal",
+    storage_usb_action="video_set_storage_usb",
+    curate_action="video_curate_to_favorites", delete_action="video_delete_current",
+    play_pause_action="video_play_pause", seek_forward_action="video_seek_forward",
+    next_action="video_next_song",
+)
+
+# Reinit -- video-only, so applied AFTER the shared builder rather than as
+# another _build_grid_layout parameter (there is no music-page equivalent:
+# MPD's audio output has no boot-time HDMI/DRM handshake to get stuck
+# behind — see actions.video_reinit's docstring for the actual problem this
+# fixes). Placed immediately before Delete (index(2,6)) at the user's
+# request ("in front of Trash"), overwriting what would otherwise be the
+# last of row 2's 4 content squares (index(2,5)) — on the VIDEO grid only;
+# LAYOUT_BROWSE (music) keeps its full 4 content squares untouched. This
+# does mean one particular content slot per browse "page" never gets a key
+# to render in on the video grid specifically — an accepted, minor tradeoff
+# for a maintenance button that's reached far less often than actual
+# browsing.
+LAYOUT_VIDEO_BROWSE[index(2, 5)] = KeyDef(
+    "glyph", action="video_reinit",
+    params={"symbol": "refresh", "caption": "HDMI"},
+)
+
+
+def video_browse_grid_key_def(key: int) -> KeyDef | None:
+    return LAYOUT_VIDEO_BROWSE.get(key)
 
 
 # ---------------------------------------------------------------------------

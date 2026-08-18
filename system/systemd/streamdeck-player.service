@@ -18,8 +18,8 @@ StartLimitBurst=0
 
 [Service]
 Type=simple
-User=pi
-Group=pi
+User=rpi
+Group=rpi
 # plugdev: open the Stream Deck hidraw node (see 99-streamdeck.rules)
 SupplementaryGroups=plugdev audio
 
@@ -63,7 +63,13 @@ RuntimeDirectory=rpi-player
 RuntimeDirectoryMode=0770
 
 # --- Hardening --------------------------------------------------------------
-NoNewPrivileges=yes
+# NoNewPrivileges intentionally omitted: the service calls
+# `sudo /usr/local/sbin/usb-remount-rw` to recover from the exFAT
+# errors=remount-ro kernel default (see actions.py _try_remount_usb_rw).
+# sudo requires the ability to gain new privileges; NoNewPrivileges=yes
+# prevents that with "The 'no new privileges' flag is set". The sudoers
+# rule (50-rpi-usb-remount) locks the escalation to exactly one script so
+# the security surface is still narrow.
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
@@ -97,7 +103,26 @@ ProtectHome=read-only
 # Keep these in sync with config.toml's [delete] trash_dir/log_path/
 # music_dir and [video] library_dir if you ever change them from the
 # defaults.
-ReadWritePaths=-/run/rpi-player -/run/user/1000 /home/rpi/Music /home/rpi/Music-trash /home/rpi/deleted-tracks.log /home/rpi/Video
+#
+# Widened from individual child paths (Music, Music-trash, the deletion log,
+# Video) to the whole home directory after the SAME "[Errno 30] Read-only
+# file system" failure showed up again for a DIFFERENT reason: the
+# Internal/USB storage-source toggle (player/actions.py's
+# toggle_storage_source/video_toggle_storage_source) needs to unlink and
+# recreate the /home/rpi/Music and /home/rpi/Video symlinks THEMSELVES, not
+# just write into their contents. Replacing a directory entry is a write to
+# its PARENT directory (/home/rpi), which none of the previous child-only
+# entries granted, no matter how many of Music/Music-trash/Video were
+# individually listed — found live, 100% reproducible, the exact same
+# failure signature as the original delete_current bug this section
+# documents above. /home/rpi is this service's own home directory (User=rpi
+# already), so this isn't a meaningful widening of what the service can
+# already effectively reach via its listed children.
+# -/mnt/usb-storage: ProtectSystem=strict makes the entire / hierarchy
+# read-only; /mnt is not exempted, so USB writes would fail with EPERM
+# even after a successful sudo remount-rw. The '-' prefix makes it
+# optional so startup does not fail when no USB drive is plugged in.
+ReadWritePaths=-/run/rpi-player -/run/user/1000 /home/rpi -/mnt/usb-storage
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

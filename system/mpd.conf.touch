@@ -1,0 +1,105 @@
+#
+# /etc/mpd.conf  —  RPi TOUCH player (rpi-touch, Pi 5 + 7" DSI touchscreen)
+#
+# This profile has NO USB DAC — aplay -l on this hardware only ever showed
+# the two onboard HDMI outputs (vc4hdmi0/vc4hdmi1). "Local" is defined below
+# for parity with the rpi-audio profile (system/mpd.conf) and left DISABLED
+# so it never errors trying to open a card that doesn't exist here. If a DAC
+# is ever added to this Pi, flip Local's device/enabled the same way
+# rpi-audio's is configured and set config.toml's default_route_id back to
+# "local".
+#
+#   [0] "Local"    -> disabled on this profile, no DAC present.
+#   [1] "Network"  -> PipeWire. Bluetooth AND AirPlay both live behind this.
+#                     config.toml's default_route_id = "bt" on this branch.
+#   [2] "HDMI"     -> ALSA plughw: to the Pi's own HDMI (convenience only).
+#
+# Bluetooth vs AirPlay is NOT an MPD-level choice — both are PipeWire sinks.
+# Switching between them means changing PipeWire's default sink (wpctl
+# set-default) while MPD keeps sending to the same "Network" output.
+# player/outputs.py implements exactly this two-layer model.
+#
+
+music_directory     "/home/rpi/Music"
+playlist_directory  "/var/lib/mpd/playlists"
+db_file             "/var/lib/mpd/tag_cache"
+state_file          "/var/lib/mpd/state"
+sticker_file        "/var/lib/mpd/sticker.sql"
+
+# user/group are set by the systemd override (mpd runs as the desktop user so
+# it can reach that user's PipeWire socket). Do NOT re-enable them here.
+#user               "mpd"
+#group              "audio"
+
+bind_to_address     "127.0.0.1"
+port                "6600"
+bind_to_address     "/run/mpd/socket"
+
+log_file            "syslog"
+log_level           "notice"
+
+restore_paused      "yes"
+auto_update         "yes"
+auto_update_depth   "6"
+
+zeroconf_enabled    "yes"
+zeroconf_name       "RPi-Touch"
+
+replaygain           "off"
+volume_normalization "no"
+
+input {
+    plugin "curl"
+}
+
+#
+# ---------------------------------------------------------------------------
+# OUTPUT 0 — Local wired DAC — NOT PRESENT ON THIS PI, DISABLED
+# ---------------------------------------------------------------------------
+# No USB DAC on rpi-touch. Kept as a stanza (not deleted) so the block
+# structure matches rpi-audio's mpd.conf and so it's a one-line flip
+# (enabled "yes" + a real device=) if a DAC is ever added here. The device=
+# below is a placeholder, not a real card — do not enable this without
+# changing it to match `aplay -l` on THIS Pi first.
+#
+audio_output {
+    type            "alsa"
+    name            "Local"
+    device          "hw:CARD=NONE,DEV=0"
+    mixer_type      "software"
+    auto_resample   "no"
+    auto_format     "no"
+    auto_channels   "no"
+    enabled         "no"
+}
+
+#
+# ---------------------------------------------------------------------------
+# OUTPUT 1 — PipeWire (carries Bluetooth A2DP and AirPlay/RAOP)
+# ---------------------------------------------------------------------------
+# No target= on purpose: it follows PipeWire's *default* sink, which the router
+# changes with `wpctl set-default`. One MPD output, many wireless destinations.
+#
+audio_output {
+    type            "pipewire"
+    name            "Network"
+    mixer_type      "software"
+    enabled         "no"
+}
+
+#
+# ---------------------------------------------------------------------------
+# OUTPUT 2 — HDMI (convenience)
+# ---------------------------------------------------------------------------
+# "plughw:", not "hw:" — vc4hdmi accepts ONLY IEC958_SUBFRAME_LE, so a bare
+# hw: device rejects plain PCM with "Failed to configure format". The plug
+# layer converts. Losing bit-perfect here costs nothing; the DAC above is the
+# quality path. See docs/AUDIO-OUTPUT.md section 2.
+#
+audio_output {
+    type            "alsa"
+    name            "HDMI"
+    device          "plughw:CARD=vc4hdmi0,DEV=0"
+    mixer_type      "software"
+    enabled         "no"
+}

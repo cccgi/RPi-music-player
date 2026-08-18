@@ -1,0 +1,22 @@
+// /etc/polkit-1/rules.d/53-rpi-player-video-mpv.rules
+//
+// Same shape as 49-rpi-player-shutdown.rules, 50-rpi-player-wifi.rules,
+// 51-rpi-player-bluetooth.rules, and 52-rpi-player-network.rules, for a
+// fifth D-Bus action: the video page's "Reinit" key (player/actions.py's
+// video_reinit) runs `systemctl restart video-mpv.service` to force mpv to
+// re-probe its DRM/HDMI output after a monitor is plugged in post-boot (see
+// that action's docstring for why a full process restart, not just an IPC
+// property poke, is what's actually needed). `systemctl restart` talks to
+// systemd over D-Bus, which requires polkit authorization for
+// org.freedesktop.systemd1.manage-units -- there is no session/agent for
+// the unattended "rpi" service account to answer a password prompt, so
+// without this rule the button would fail exactly as silently as every
+// other systemctl action here did before its rule existed. Scoped to
+// video-mpv.service only.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "video-mpv.service" &&
+        subject.user == "rpi") {
+        return polkit.Result.YES;
+    }
+});

@@ -13,6 +13,7 @@ on-screen toast.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import threading
@@ -87,6 +88,13 @@ class ActionContext:
     # (the Wi-Fi toggle key lives on the Video page only), so a single
     # cached bool per ActionContext is enough; no cross-process sync needed.
     wifi_enabled: bool = True
+    # Whether Shuffle is currently in its "All" state (queue replaced with
+    # the ENTIRE current-source library, not just the current folder) — see
+    # cycle_shuffle_mode. MPD itself only has one boolean (`random`), no
+    # concept of "shuffle scope", so this distinguishes "Folder" from "All"
+    # the same way video_local_was_enabled tracks state MPD has no field
+    # for. Mutated at runtime by cycle_shuffle_mode only.
+    shuffle_all_active: bool = False
 
 
 ActionFn = Callable[[ActionContext, int], str | None]
@@ -456,6 +464,84 @@ def _toggle_consume(ctx: ActionContext, magnitude: int) -> str | None:
     return f"Consume {'on' if ctx.mpd.status().get('consume') == '1' else 'off'}"
 
 
+@action("cycle_repeat_mode")
+def _cycle_repeat_mode(ctx: ActionContext, magnitude: int) -> str | None:
+    """Replaces the old separate Repeat/Single buttons with one 3-state
+    cycle: Off -> Folder -> Song -> Off. "Single" (repeat only the current
+    track) was its own button before this — asked to be removed and folded
+    into Repeat instead, since it's really just a stronger repeat mode, not
+    an independent concept.
+
+    "Folder" reuses MPD's plain repeat=1/single=0 as-is: this player's own
+    browsing convention already replaces the queue with the CONTAINING
+    FOLDER whenever a track is picked (see LibraryBrowser.enter() /
+    play_uri_from_directory) or with the entire library when Shuffle's
+    "All" mode is active (see cycle_shuffle_mode) — so "repeat whatever's
+    in the queue" already means "repeat the folder" under normal use,
+    with no new mechanism needed. "Song" is MPD's repeat=1/single=1 combo
+    (loops just the current track forever). State is read live from MPD's
+    own repeat/single flags, not stored separately, so this can never drift
+    from what MPD is actually doing.
+    """
+    status = ctx.mpd.status()
+    repeat = status.get("repeat") == "1"
+    single = status.get("single") == "1"
+
+    if not repeat:
+        # Off (or the single-without-repeat state MPD allows but this app
+        # never produces) -> Folder.
+        ctx.mpd.set_repeat(True)
+        ctx.mpd.set_single(False)
+        return "Repeat: Folder"
+    if not single:
+        # Folder -> Song.
+        ctx.mpd.set_single(True)
+        return "Repeat: Song"
+    # Song -> Off.
+    ctx.mpd.set_repeat(False)
+    ctx.mpd.set_single(False)
+    return "Repeat: Off"
+
+
+@action("cycle_shuffle_mode")
+def _cycle_shuffle_mode(ctx: ActionContext, magnitude: int) -> str | None:
+    """Replaces the old plain on/off Shuffle toggle with a 3-state cycle:
+    Off -> Folder -> All -> Off.
+
+    "Folder" just enables MPD's `random` flag on whatever's already queued
+    (the current folder, per this player's normal browsing convention —
+    see cycle_repeat_mode's docstring for the same reasoning). "All"
+    replaces the queue with the ENTIRE current-source library (Internal or
+    USB, whichever the storage-source toggle currently has active —
+    music_storage_label() reads that live) and shuffles across all of it.
+
+    MPD has no native concept of "shuffle scope" (just one boolean,
+    `random`), so which of "Folder"/"All" is active is tracked on
+    ``ctx.shuffle_all_active`` rather than derived from MPD state — same
+    pattern as video_local_was_enabled tracking state MPD itself has no
+    field for.
+    """
+    status = ctx.mpd.status()
+    random_on = status.get("random") == "1"
+
+    if not random_on:
+        # Off -> Folder: enable random on the current (folder-scoped) queue.
+        ctx.mpd.set_random(True)
+        ctx.shuffle_all_active = False
+        return "Shuffle: Folder"
+    if not ctx.shuffle_all_active:
+        # Folder -> All: load the entire current-source library, then shuffle.
+        source = music_storage_label()
+        ctx.mpd.replace_queue_with_library()
+        ctx.mpd.set_random(True)
+        ctx.shuffle_all_active = True
+        return f"Shuffle: All ({source})"
+    # All -> Off.
+    ctx.mpd.set_random(False)
+    ctx.shuffle_all_active = False
+    return "Shuffle: Off"
+
+
 # ---------------------------------------------------------------------------
 # Crossfade
 # ---------------------------------------------------------------------------
@@ -487,8 +573,489 @@ def _toggle_crossfade(ctx: ActionContext, magnitude: int) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Curate — move the currently playing file into a "Curated" subfolder inside
+# its own containing directory, one tap, without touching playback/queue
+# state at all. Safe to do live: shutil.move on the SAME filesystem does not
+# invalidate an already-open file descriptor on Linux, so whatever is
+# currently playing keeps playing uninterrupted through the move.
+# ---------------------------------------------------------------------------
+
+
+def _try_remount_usb_rw() -> bool:
+    """If the USB drive has been auto-remounted read-only by the exFAT
+    kernel driver (errno 30 EROFS), call the wrapper script installed at
+    /usr/local/sbin/usb-remount-rw (granted passwordless sudo via
+    /etc/sudoers.d/50-rpi-usb-remount) to flip it back to rw.
+
+    Returns True if the remount succeeded or wasn't needed, False on failure.
+    Called as a recovery step before retrying a failed delete/curate.
+    """
+    try:
+        result = subprocess.run(
+            ["sudo", "/usr/local/sbin/usb-remount-rw"],
+            timeout=5, capture_output=True,
+        )
+        if result.returncode == 0:
+            LOG.warning("USB remounted rw after EROFS; retrying operation")
+            return True
+        LOG.error("usb-remount-rw failed (rc=%d): %s",
+                  result.returncode, result.stderr.decode().strip())
+        return False
+    except Exception as exc:
+        LOG.error("usb-remount-rw exception: %s", exc)
+        return False
+
+
+def _unique_target(dest_dir: Path, name: str) -> Path:
+    """``dest_dir / name``, or a numeric-suffixed variant if that already
+    exists — never overwrites, never raises on a collision."""
+    target = dest_dir / name
+    if not target.exists():
+        return target
+    stem, suffix = target.stem, target.suffix
+    n = 1
+    while True:
+        candidate = dest_dir / f"{stem} ({n}){suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+@action("curate_current")
+def _curate_current(ctx: ActionContext, magnitude: int) -> str | None:
+    """Move MPD's currently playing file into a Curated/ subfolder inside
+    its own containing directory, then trigger a targeted (not full-library)
+    ``mpd update`` so the browser/library reflects the move.
+
+    Deliberately does not stop playback, touch the queue, or wait for the
+    database update — see the module comment above for why the move itself
+    is safe to do live, and update_database's existing fire-and-forget style
+    for why the ``update`` call doesn't need to be awaited either.
+    """
+    song = ctx.mpd.current_song()
+    uri = song.get("file", "")
+    if not uri:
+        return "Nothing playing"
+
+    music_dir = (getattr(ctx.delete, "music_dir", "") if ctx.delete else "") or "/home/rpi/Music"
+    root = Path(music_dir)
+    rel_dir = str(Path(uri).parent)
+    if rel_dir in (".", "/"):
+        rel_dir = ""
+
+    src = root / uri
+    if not src.is_file():
+        return "File missing"
+
+    dest_dir = (root / rel_dir / "Curated") if rel_dir else (root / "Curated")
+    for attempt in (1, 2):
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            target = _unique_target(dest_dir, src.name)
+            shutil.move(str(src), str(target))
+            break
+        except OSError as exc:
+            if exc.errno == 30 and attempt == 1:  # EROFS — try remounting rw
+                if not _try_remount_usb_rw():
+                    LOG.error("curate failed for %s: %s", src, exc)
+                    return "Curate failed"
+                time.sleep(0.3)
+                continue
+            LOG.error("curate failed for %s: %s", src, exc)
+            return "Curate failed"
+
+    update_dir = f"{rel_dir}/Curated" if rel_dir else "Curated"
+    ctx.mpd._call("update", update_dir)
+    LOG.info("curated: %s -> %s", src, target)
+    return "Curated"
+
+
+@action("video_curate_current")
+def _video_curate_current(ctx: ActionContext, magnitude: int) -> str | None:
+    """Video's equivalent of curate_current — moves the currently playing
+    VideoEntry into a Curated/ subfolder inside its own directory, then
+    a synchronous rescan (matching video_rescan's existing style, unlike
+    music's fire-and-forget ``mpd update``) so the library reflects the
+    move immediately. Clears the stale resume-position bookkeeping keyed
+    by the OLD path so it doesn't linger pointing at nothing.
+    """
+    if ctx.video_library is None:
+        return None
+    entry = ctx.video_library.current
+    if entry is None:
+        return "Nothing playing"
+
+    src = Path(entry.path)
+    if not src.is_file():
+        return "File missing"
+
+    dest_dir = src.parent / "Curated"
+    for attempt in (1, 2):
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            target = _unique_target(dest_dir, src.name)
+            shutil.move(str(src), str(target))
+            break
+        except OSError as exc:
+            if exc.errno == 30 and attempt == 1:
+                if not _try_remount_usb_rw():
+                    LOG.error("video curate failed for %s: %s", src, exc)
+                    return "Curate failed"
+                time.sleep(0.3)
+                continue
+            LOG.error("video curate failed for %s: %s", src, exc)
+            return "Curate failed"
+
+    ctx.video_library.forget_position(str(src))
+    ctx.video_library.rescan()
+    LOG.info("curated video: %s -> %s", src, target)
+    return "Curated"
+
+
+def _curate_to_folder(ctx: ActionContext, folder_name: str) -> str | None:
+    """Shared implementation for curate_to_favorites and any future
+    named-folder curate variants.  Moves the current track into
+    ``<containing_dir>/<folder_name>/`` rather than ``Curated/``."""
+    song = ctx.mpd.current_song()
+    uri = song.get("file", "")
+    if not uri:
+        return "Nothing playing"
+
+    music_dir = (getattr(ctx.delete, "music_dir", "") if ctx.delete else "") or "/home/rpi/Music"
+    root = Path(music_dir)
+    rel_dir = str(Path(uri).parent)
+    if rel_dir in (".", "/"):
+        rel_dir = ""
+
+    src = root / uri
+    if not src.is_file():
+        return "File missing"
+
+    dest_dir = (root / rel_dir / folder_name) if rel_dir else (root / folder_name)
+    for attempt in (1, 2):
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            target = _unique_target(dest_dir, src.name)
+            shutil.move(str(src), str(target))
+            break
+        except OSError as exc:
+            if exc.errno == 30 and attempt == 1:
+                if not _try_remount_usb_rw():
+                    LOG.error("curate_to_folder(%s) failed for %s: %s", folder_name, src, exc)
+                    return "Curate failed"
+                time.sleep(0.3)
+                continue
+            LOG.error("curate_to_folder(%s) failed for %s: %s", folder_name, src, exc)
+            return "Curate failed"
+
+    update_dir = f"{rel_dir}/{folder_name}" if rel_dir else folder_name
+    ctx.mpd._call("update", update_dir)
+    LOG.info("curated to %s: %s -> %s", folder_name, src, target)
+    return f"→ {folder_name}"
+
+
+@action("curate_to_favorites")
+def _curate_to_favorites(ctx: ActionContext, magnitude: int) -> str | None:
+    """Move the current music track into a Favorites/ subfolder alongside it."""
+    return _curate_to_folder(ctx, "Favorites")
+
+
+@action("video_curate_to_favorites")
+def _video_curate_to_favorites(ctx: ActionContext, magnitude: int) -> str | None:
+    """Move the current video into a Favorites/ subfolder alongside it."""
+    if ctx.video_library is None:
+        return None
+    entry = ctx.video_library.current
+    if entry is None:
+        return "Nothing playing"
+
+    src = Path(entry.path)
+    if not src.is_file():
+        return "File missing"
+
+    dest_dir = src.parent / "Favorites"
+    for attempt in (1, 2):
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            target = _unique_target(dest_dir, src.name)
+            shutil.move(str(src), str(target))
+            break
+        except OSError as exc:
+            if exc.errno == 30 and attempt == 1:
+                if not _try_remount_usb_rw():
+                    LOG.error("video curate_to_favorites failed for %s: %s", src, exc)
+                    return "Curate failed"
+                time.sleep(0.3)
+                continue
+            LOG.error("video curate_to_favorites failed for %s: %s", src, exc)
+            return "Curate failed"
+
+    ctx.video_library.forget_position(str(src))
+    ctx.video_library.rescan()
+    LOG.info("curated video to Favorites: %s -> %s", src, target)
+    return "→ Favorites"
+
+
+# ---------------------------------------------------------------------------
+# Storage source toggle — internal microSD vs external USB drive.
+#
+# /home/rpi/Music and /home/rpi/Video are (or will shortly be, per the
+# infrastructure set up separately/outside this codebase — no /etc/fstab,
+# no SSH, no mount handling here) symlinks, each pointing at either the
+# original "-internal" directory or a mounted USB drive's Audio/Video
+# subfolder. MPD's music_directory config and config.toml's video.
+# library_dir both stay fixed at the symlink path FOREVER — only the
+# symlink TARGET ever changes. That makes this pure filesystem symlink
+# manipulation: no new root/polkit permission (the symlinks live under
+# /home/rpi, already owned by the `rpi` service user), no mpd.conf edit, no
+# service restart.
+# ---------------------------------------------------------------------------
+
+_MUSIC_LINK = Path("/home/rpi/Music")
+_MUSIC_INTERNAL = Path("/home/rpi/Music-internal")
+_MUSIC_USB = Path("/mnt/usb-storage/Audio")
+
+_VIDEO_LINK = Path("/home/rpi/Video")
+_VIDEO_INTERNAL = Path("/home/rpi/Video-internal")
+_VIDEO_USB = Path("/mnt/usb-storage/Video")
+
+USB_MOUNT_POINT = Path("/mnt/usb-storage")
+
+
+def usb_mounted() -> bool:
+    """Whether the USB drive's mountpoint is currently a REAL, live mount —
+    as opposed to just "the /mnt/usb-storage directory exists", which stays
+    true even after the drive is physically removed (the mountpoint itself
+    lives on the internal SD card/eMMC, not the USB drive). Used by the
+    eject-detection watcher (streamdeck_daemon._watch_usb) to tell "drive
+    present" apart from "drive gone but nothing has noticed yet".
+
+    Wrapped in try/except: a mount whose underlying block device just
+    vanished (a yank, not a clean unmount) can make stat() calls return I/O
+    errors rather than cleanly reporting "not a mountpoint" — either case
+    means "treat it as gone".
+    """
+    try:
+        return os.path.ismount(USB_MOUNT_POINT)
+    except OSError:
+        return False
+
+
+def _current_symlink_target(link: Path) -> Path | None:
+    """The symlink's target, resolved to an absolute path — cheap (a single
+    ``os.readlink``), so callers can read this live on every render instead
+    of caching daemon-side state that could drift out of sync with the
+    filesystem (same pattern as power_draw's read_pi_current_ma(), called
+    fresh on every render pass rather than cached).
+    """
+    try:
+        raw_target = os.readlink(link)
+    except OSError:
+        return None
+    target = Path(raw_target)
+    if not target.is_absolute():
+        target = (link.parent / target).resolve()
+    return target
+
+
+def _set_symlink(link: Path, target: Path) -> bool:
+    """Point ``link`` at ``target`` explicitly. Idempotent — a no-op success
+    if it's already pointed there. Refuses to touch the symlink at all if
+    ``target`` doesn't exist (e.g. the USB drive isn't mounted) — a
+    partially-applied swap pointing at nothing would be worse than just
+    declining the press.
+    """
+    if _current_symlink_target(link) == target:
+        return True
+    if not target.is_dir():
+        return False
+    try:
+        if link.is_symlink() or link.exists():
+            os.unlink(link)
+        os.symlink(target, link)
+    except OSError as exc:
+        LOG.error("storage source set failed for %s -> %s: %s", link, target, exc)
+        return False
+    return True
+
+
+def _swap_symlink(link: Path, internal: Path, usb: Path) -> tuple[bool, str]:
+    """Toggle ``link`` between ``internal`` and ``usb``. Returns
+    ``(success, label_or_failure_toast)``."""
+    going_to_usb = _current_symlink_target(link) != usb
+    new_target = usb if going_to_usb else internal
+    if not _set_symlink(link, new_target):
+        return False, "USB not mounted" if going_to_usb else "Internal missing"
+    return True, ("USB" if going_to_usb else "Internal")
+
+
+def music_storage_label() -> str:
+    """"USB" or "Internal", derived live from the symlink target — used by
+    the Stream Deck tile's ``sub`` label on every render (see
+    streamdeck_daemon's "label" render branch for toggle_storage_source),
+    never cached, so it can never drift from what the filesystem actually
+    says.
+    """
+    return "USB" if _current_symlink_target(_MUSIC_LINK) == _MUSIC_USB else "Internal"
+
+
+def video_storage_label() -> str:
+    return "USB" if _current_symlink_target(_VIDEO_LINK) == _VIDEO_USB else "Internal"
+
+
+def music_usb_available() -> bool:
+    """Whether the USB drive is actually mounted right now — used to grey
+    out the page-2 "USB" quick-select button when it isn't, same as a route
+    key's own available/unavailable rendering. Checks the real mountpoint
+    (usb_mounted()) first, not just whether the Audio subfolder happens to
+    stat() successfully — see usb_mounted()'s docstring for why that
+    distinction matters right after a physical unplug."""
+    if not usb_mounted():
+        return False
+    try:
+        return _MUSIC_USB.is_dir()
+    except OSError:
+        return False
+
+
+def video_usb_available() -> bool:
+    if not usb_mounted():
+        return False
+    try:
+        return _VIDEO_USB.is_dir()
+    except OSError:
+        return False
+
+
+@action("toggle_storage_source")
+def _toggle_storage_source(ctx: ActionContext, magnitude: int) -> str | None:
+    """Swap /home/rpi/Music between its internal directory and a mounted
+    USB drive. Stops playback first — the currently open file's containing
+    directory is about to vanish (from the listener's perspective; MPD's
+    library_dir path itself never changes) mid-track otherwise — then swaps
+    the symlink and triggers an ``mpd update``.
+
+    That update() call is fire-and-forget at the MPD PROTOCOL level: MPD
+    acknowledges the command immediately and does the actual (possibly
+    60-90+ second, for a large library) file walk in ITS OWN background
+    thread — this call, and therefore this whole action/button-press,
+    returns instantly either way. The "Scanning..." label that used to sit
+    on this button (removed) was what made it FEEL stuck, not the button
+    itself ever blocking. Without triggering update() at all, the button
+    stayed instant but MPD's database went permanently stale relative to
+    whichever source is actually linked — reported live as "the folder
+    __Alex Do from USB stays on row 1 after switching to Internal", i.e.
+    the browser kept showing the last-indexed (wrong) content forever, not
+    just slowly. Now: instant symlink flip AND instant button response,
+    with the browser catching up on its own the moment MPD's background
+    scan finishes — see streamdeck_daemon._watch_mpd's existing "database"
+    idle-event handler, already wired to refresh both the page-1 and
+    page-2 browsers with no polling needed.
+    """
+    if ctx.mpd.status().get("state") == "play":
+        ctx.mpd.stop()
+    ok, label = _swap_symlink(_MUSIC_LINK, _MUSIC_INTERNAL, _MUSIC_USB)
+    if not ok:
+        return label
+    ctx.mpd.update_database()
+    return label
+
+
+@action("video_toggle_storage_source")
+def _video_toggle_storage_source(ctx: ActionContext, magnitude: int) -> str | None:
+    """Video's equivalent of toggle_storage_source — swaps /home/rpi/Video,
+    then a synchronous rescan. Unlike MPD's database, VideoLibrary.rescan()
+    is a plain directory listing (no tag-parsing per file at this scale)
+    and has consistently measured near-instant even on real use (e.g. "36
+    file(s)" logged with no perceptible delay) — so, unlike the music side,
+    there is no slow-background-job problem to work around here; doing it
+    synchronously is what makes the "up next" list on page 1 actually match
+    the new source right away, addressing the same "stale after switching"
+    complaint as the music fix above.
+    """
+    ok, label = _swap_symlink(_VIDEO_LINK, _VIDEO_INTERNAL, _VIDEO_USB)
+    if not ok:
+        return label
+    if ctx.video_library is not None:
+        count = ctx.video_library.rescan()
+        return f"{label} {count}"
+    return label
+
+
+# ---------------------------------------------------------------------------
+# Page-2 direct storage-source select — the two "Internal"/"USB" quick-jump
+# keys on the browse grid's bottom row (layout.LAYOUT_BROWSE/
+# LAYOUT_VIDEO_BROWSE index(3,1)/index(3,2)). Unlike the toggle above these
+# set an EXPLICIT target rather than flipping whatever's currently active —
+# pressing "USB" always means USB, even if you're already on USB (a no-op
+# in that case, not a flip back to Internal), which is what makes them safe
+# to press without first checking the current state.
+# ---------------------------------------------------------------------------
+
+
+def _apply_music_storage_set(ctx: ActionContext, target: str) -> str | None:
+    dest = _MUSIC_INTERNAL if target == "internal" else _MUSIC_USB
+    if ctx.mpd.status().get("state") == "play":
+        ctx.mpd.stop()
+    if not _set_symlink(_MUSIC_LINK, dest):
+        return "USB not mounted" if target == "usb" else "Internal missing"
+    ctx.mpd.update_database()
+    return "USB" if target == "usb" else "Internal"
+
+
+@action("set_storage_internal")
+def _set_storage_internal(ctx: ActionContext, magnitude: int) -> str | None:
+    return _apply_music_storage_set(ctx, "internal")
+
+
+@action("set_storage_usb")
+def _set_storage_usb(ctx: ActionContext, magnitude: int) -> str | None:
+    return _apply_music_storage_set(ctx, "usb")
+
+
+def _apply_video_storage_set(ctx: ActionContext, target: str) -> str | None:
+    dest = _VIDEO_INTERNAL if target == "internal" else _VIDEO_USB
+    if not _set_symlink(_VIDEO_LINK, dest):
+        return "USB not mounted" if target == "usb" else "Internal missing"
+    label = "USB" if target == "usb" else "Internal"
+    if ctx.video_library is not None:
+        count = ctx.video_library.rescan()
+        return f"{label} {count}"
+    return label
+
+
+@action("video_set_storage_internal")
+def _video_set_storage_internal(ctx: ActionContext, magnitude: int) -> str | None:
+    return _apply_video_storage_set(ctx, "internal")
+
+
+@action("video_set_storage_usb")
+def _video_set_storage_usb(ctx: ActionContext, magnitude: int) -> str | None:
+    return _apply_video_storage_set(ctx, "usb")
+
+
+# ---------------------------------------------------------------------------
 # Output routing
 # ---------------------------------------------------------------------------
+
+
+@action("route_to_local")
+def _route_to_local(ctx: ActionContext, magnitude: int) -> str | None:
+    """Switch MPD's own output to Local/USB DAC — the music page's
+    equivalent of video_route_local, but far simpler: MPD already owns this
+    device directly (no ALSA hand-off dance the way mpv needs), so this is
+    just ``OutputRouter.switch_to`` guarded the same way every other
+    route-switch call site in this codebase already guards it (see
+    _video_route_local / the route-key press handling in
+    streamdeck_daemon._on_key) — unavailable is reported as a toast, never
+    silently ignored.
+    """
+    if ctx.router is None:
+        return None
+    route = next((r for r in ctx.router.routes if r.id == "local"), None)
+    if route is None or not ctx.router.is_available(route):
+        return "DAC unavailable"
+    return route.label if ctx.router.switch_to(route) else "Unavailable"
 
 
 @action("cycle_output")
@@ -914,6 +1481,100 @@ def _video_rescan(ctx: ActionContext, magnitude: int) -> str | None:
     return f"{count} video{'s' if count != 1 else ''}"
 
 
+@action("video_reinit")
+def _video_reinit(ctx: ActionContext, magnitude: int) -> str | None:
+    """Restart the mpv video engine (video-mpv.service) to force a fresh
+    HDMI/DRM output probe.
+
+    video-mpv.service starts with ``--vo=drm,null`` (see that unit file's
+    own comment): if no HDMI monitor is connected at BOOT, mpv's DRM output
+    fails to initialize and falls back to the no-op "null" video output —
+    permanently, for the life of that mpv process. Plugging a monitor in
+    later does nothing; mpv never re-probes DRM on its own; the box keeps
+    playing audio with no video output until something forces a fresh
+    start. Reported live as exactly that. A full process restart (not just
+    an mpv IPC property poke) is what's needed — the vo fallback decision
+    happens once, at process startup, and `--vo=drm,null` gives no runtime
+    "retry drm" affordance to hook into over IPC.
+
+    Needs org.freedesktop.systemd1.manage-units authorization for
+    video-mpv.service specifically — see
+    system/polkit/53-rpi-player-video-mpv.rules. Without that rule this
+    just fails (non-zero exit, caught below), same as every other
+    ``systemctl`` action in this codebase without its matching rule.
+
+    Remembers whatever was loaded and its playback position beforehand
+    (same take_resume_position/load_and_play pair enter_video_mode uses)
+    and resumes it once the fresh mpv process's IPC socket is back up —
+    otherwise this would silently leave video mode sitting on a blank,
+    idle mpv with nothing loaded, which defeats the point of a "fix my
+    video output" button.
+
+    Also explicitly restores whatever mpv's volume was set to right before
+    the restart. A freshly-started mpv process resets its own softvol to
+    its default (100%) — reported live as this button silently blasting
+    the volume to max even though the video itself came back fine. Every
+    other place this codebase deliberately changes mpv's volume records it
+    on ``ctx.video_last_set_volume`` first (see video_volume_up/down,
+    video_toggle_mute) so a later drift-check can tell "we did this on
+    purpose" apart from "mpv's volume reverted on its own" — this restore
+    is exactly that same "mpv's volume reverted on its own" case, just
+    triggered by a full process restart instead of a crash-loop.
+    """
+    if ctx.video is None or ctx.video_library is None:
+        return None
+
+    saved_volume = ctx.video.volume()
+    _capture_video_position(ctx)
+    entry = ctx.video_library.current
+    resume = ctx.video_library.take_resume_position(entry.path) if entry else None
+
+    try:
+        proc = subprocess.run(
+            ["systemctl", "restart", "video-mpv.service"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        LOG.error("systemctl restart video-mpv.service failed: %s", exc)
+        return "Reinit failed"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        LOG.error("systemctl restart video-mpv.service exited %d: %s",
+                  proc.returncode, detail[-1] if detail else "no output")
+        return "Reinit failed"
+
+    # Wait for the FRESH mpv process's IPC socket to actually accept
+    # connections and answer before trying to reload anything into it —
+    # command()'s own one-retry-on-a-dead-socket logic covers a socket that
+    # merely hiccuped, not "the whole process is still mid-restart".
+    deadline = time.monotonic() + 8.0
+    ready = False
+    while time.monotonic() < deadline:
+        if ctx.video.get("idle-active", None) is not None:
+            ready = True
+            break
+        time.sleep(0.3)
+    if not ready:
+        return "Reinit: no reply"
+
+    ctx.video.set_volume(saved_volume)
+    ctx.video_last_set_volume = saved_volume
+
+    if entry is None:
+        return "HDMI reinit"
+    try:
+        load_and_play(ctx.video, entry, resume=resume)
+    except (SkpParseError, VideoError) as exc:
+        LOG.error("video reinit: reload failed for %s: %s", entry.path, exc)
+        return "Reinit OK, load failed"
+    # A fresh load_and_play can itself reset mpv's softvol, same as the
+    # process restart did -- reassert it once more after, not just before.
+    ctx.video.set_volume(saved_volume)
+    ctx.video_last_set_volume = saved_volume
+    _clamp_video_volume_if_airplay(ctx)
+    return "HDMI reinit"
+
+
 @action("video_delete_current")
 def _video_delete_current(ctx: ActionContext, magnitude: int) -> str | None:
     """Delete/trash/skip the CURRENTLY PLAYING video — the video-page
@@ -1018,6 +1679,8 @@ def _video_delete_current(ctx: ActionContext, magnitude: int) -> str | None:
             LOG.warning("video delete attempt %d/2 failed for %s: %s",
                         attempt, old_path, exc)
             if attempt == 1:
+                if exc.errno == 30:  # EROFS — USB went read-only; try to recover
+                    _try_remount_usb_rw()
                 time.sleep(0.6)
 
     if last_exc is not None:
@@ -1319,6 +1982,8 @@ def _delete_current(ctx: ActionContext, magnitude: int) -> str | None:
             last_exc = exc
             LOG.warning("delete attempt %d/2 failed for %s: %s", attempt, path, exc)
             if attempt == 1:
+                if exc.errno == 30:  # EROFS — USB went read-only; try to recover
+                    _try_remount_usb_rw()
                 time.sleep(0.6)
 
     if last_exc is not None:

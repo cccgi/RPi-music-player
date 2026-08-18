@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""HFP RFCOMM AT-command monitor.
+
+Runs btmon in a subprocess, parses its output, and prints every AT command
+that flows between the Pi (acting as HFP Audio Gateway) and any connected
+Bluetooth HF device (Toyota Camry, phone, etc.).
+
+USE THIS TOOL TO DISCOVER WHAT THE CAMRY SENDS WHEN YOU PRESS ITS PHONE
+KEYPAD. Run it, connect the Camry, then press *, #, and number keys on the
+Camry's on-screen phone pad. The raw AT commands will appear here.
+
+Usage:
+    sudo python3 /opt/rpi-player/bin/hfp-monitor
+
+    # or, to write a capture file for later analysis:
+    sudo python3 /opt/rpi-player/bin/hfp-monitor --save /tmp/hfp-capture.txt
+
+Requires root because btmon needs CAP_NET_RAW.
+Does NOT touch any existing BT connections — purely passive read.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+import time
+
+# Strip ANSI colour codes that btmon may emit
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[mK]')
+
+# Match btmon's hex+ASCII data lines:
+#   "          Data: 41 54 2b 56 54 53 3d 2a 0d 0a         AT+VTS=*.."
+# The hex bytes are at least 2 hex chars separated by spaces.
+_DATA_RE = re.compile(
+    r'^\s{6,}Data:\s+'           # leading indent + "Data:"
+    r'((?:[0-9a-fA-F]{2}\s*)+)'  # one or more hex bytes
+)
+
+# Recognisable AT command / response prefixes
+_AT_PREFIXES = (
+    "AT",   # commands: AT+VTS, ATDT, ATD, ATA, ATH ...
+    "+",    # unsolicited results: +CIND, +CLIP, +BCS ...
+    "OK",
+    "ERROR",
+    "RING",
+    "NO CARRIER",
+)
+
+
+def _clean(line: str) -> str:
+    return _ANSI_RE.sub("", line)
+
+
+def _decode_hex(hex_str: str) -> str:
+    """Convert a string of space-separated hex bytes to ASCII, replacing
+    non-printable characters with '.' so the output stays readable."""
+    raw = bytes.fromhex(hex_str.replace(" ", ""))
+    return "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in raw)
+
+
+def _looks_at(text: str) -> bool:
+    t = text.strip()
+    return any(t.upper().startswith(p) for p in _AT_PREFIXES)
+
+
+def run(save_path: str | None = None) -> None:
+    print("=" * 60)
+    print("HFP RFCOMM monitor — btmon passive capture")
+    print("Connect Camry via Bluetooth, then press keys on its")
+    print("on-screen phone keypad. AT commands appear below.")
+    print("Ctrl-C to stop.")
+    print("=" * 60)
+    print()
+
+    outfile = open(save_path, "w") if save_path else None
+
+    try:
+        proc = subprocess.Popen(
+            ["btmon"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        print("ERROR: btmon not found. Install: sudo apt install bluez-monitor",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # State machine: we track when we're inside an RFCOMM data frame
+    state = {
+        "direction": "?",
+        "in_rfcomm": False,
+        "frame_buf": [],   # accumulates multi-line data
+    }
+
+    def _emit(direction: str, text: str) -> None:
+        text = text.rstrip(".")  # strip padding dots from hex decode
+        text = text.replace("\r", "").replace("\n", "")
+        if not text.strip():
+            return
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {direction}: {text}"
+        print(line)
+        if outfile:
+            outfile.write(line + "\n")
+            outfile.flush()
+
+    assert proc.stdout is not None
+    for raw_line in proc.stdout:
+        line = _clean(raw_line)
+
+        # ---- direction: TX = Pi→device, RX = device→Pi ----
+        if raw_line.startswith("< "):
+            state["direction"] = "TX Pi→Device"
+            state["in_rfcomm"] = False
+        elif raw_line.startswith("> "):
+            state["direction"] = "RX Device→Pi"
+            state["in_rfcomm"] = False
+
+        # ---- enter RFCOMM data frame ----
+        stripped = line.strip()
+        if "RFCOMM:" in stripped and ("Data" in stripped or "UIH" in stripped):
+            state["in_rfcomm"] = True
+            state["frame_buf"].clear()
+            continue
+
+        # ---- reset context on blank line or new top-level frame ----
+        if not stripped or raw_line.startswith("@ ") or (
+            raw_line[0] in "<>" and raw_line[1] == " "
+        ):
+            if state["in_rfcomm"] and state["frame_buf"]:
+                # Flush accumulated data
+                text = "".join(state["frame_buf"])
+                if _looks_at(text):
+                    _emit(state["direction"], text)
+            state["in_rfcomm"] = False
+            state["frame_buf"].clear()
+            continue
+
+        if not state["in_rfcomm"]:
+            continue
+
+        # ---- parse Data: hex line ----
+        m = _DATA_RE.match(line)
+        if m:
+            decoded = _decode_hex(m.group(1))
+            state["frame_buf"].append(decoded)
+        else:
+            # Sometimes btmon shows Channel: / Credits: inside the RFCOMM block
+            # Skip those, keep accumulating
+            if any(kw in stripped for kw in ("Channel:", "Credits:", "FCS:", "Length:",
+                                              "Address:", "Control:", "L2CAP:")):
+                continue
+
+    if outfile:
+        outfile.close()
+
+
+def main() -> None:
+    if sys.platform != "linux" or subprocess.run(["id", "-u"], capture_output=True,
+                                                   text=True).stdout.strip() != "0":
+        print("WARNING: btmon typically requires root (sudo). Run with sudo if you see no output.")
+
+    p = argparse.ArgumentParser(description="HFP RFCOMM AT command monitor")
+    p.add_argument("--save", metavar="FILE",
+                   help="also write output to this file")
+    args = p.parse_args()
+
+    try:
+        run(save_path=args.save)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()

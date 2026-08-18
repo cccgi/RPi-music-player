@@ -1,0 +1,36 @@
+[Unit]
+Description=AVRCP ↔ MPD bridge (Bluetooth headphone/headunit controls)
+Documentation=file:/opt/rpi-player/docs/BLUETOOTH.md
+
+# Needs BlueZ on the system bus and MPD on localhost.
+# mpdris2 is optional (adds separate MPRIS2 metadata path) but this daemon
+# speaks directly to MPD via python-mpd2, so it works without it.
+After=bluetooth.service mpd.service
+Wants=mpd.service
+
+# Restart unconditionally — a RegisterPlayer failure on startup usually means
+# BlueZ isn't ready yet; a few-second retry almost always succeeds.
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+
+# Uses system Python3 (not the player venv) because dbus-python is a system
+# package and is not installed in the venv.  python-mpd2 is available in
+# both system Python and the venv, so this is fine.
+ExecStart=/usr/bin/python3 /opt/rpi-player/bin/avrcp-bridge
+
+Restart=always
+RestartSec=5
+
+# avrcp-bridge logs to stdout; route both to the journal.
+# Retrieve with: journalctl --user -u avrcp-bridge
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=avrcp-bridge
+# Ensure the user journal exists (needed when linger is the only session)
+LogNamespace=
+
+[Install]
+WantedBy=default.target

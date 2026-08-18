@@ -212,6 +212,18 @@ def main() -> int:
     if args.mac:
         return connect(args.mac)
 
+    if not args.match:
+        # Bare `bt-connect` with no flags used to fall through to the scan
+        # loop below, print "scanning..." a few times, then exit silently
+        # with no result and no explanation — indistinguishable from a
+        # hang or a real failure. Found live: read as "pairing isn't
+        # working" when actually nothing was ever asked to pair.
+        print("Nothing to do: pass --match <name substring>, --mac <address>, "
+              "--scan (list only), or --status.")
+        print("Example: bt-connect --match bose")
+        ap.print_help()
+        return 1
+
     deadline = time.time() + max(args.wait, 10)
     attempt = 0
     while time.time() < deadline:

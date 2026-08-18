@@ -168,6 +168,30 @@ class MpdCommander:
     def seek_to_start(self) -> None:
         self._call("seekcur", "0")
 
+    def seek_absolute(self, fraction: float) -> None:
+        """Seek to ``fraction`` (0.0-1.0) of the current track's duration.
+
+        Used by the touch UI's scrub bar drag (touch_daemon.py's
+        _apply_drag) — the touchscreen reports an absolute finger position,
+        not a relative nudge like seek_relative's TourBox/Stream Deck
+        callers, so this needs its own entry point rather than reusing that
+        one with a computed delta.
+        """
+        status = self.status()
+        if status.get("state") not in ("play", "pause"):
+            return
+        try:
+            duration = float(status.get("duration", status.get("time", "0").split(":")[-1]))
+        except (TypeError, ValueError):
+            return
+        if duration <= 0:
+            return
+        fraction = max(0.0, min(1.0, fraction))
+        target = fraction * duration
+        if target > duration - 1:
+            target = duration - 1
+        self._call("seekcur", f"{target:.1f}")
+
     # -- volume ------------------------------------------------------------
 
     def change_volume(self, delta: int) -> int | None:
@@ -206,8 +230,14 @@ class MpdCommander:
     def toggle_random(self) -> None:
         self._call("random", 0 if self.status().get("random") == "1" else 1)
 
+    def set_random(self, on: bool) -> None:
+        self._call("random", 1 if on else 0)
+
     def toggle_repeat(self) -> None:
         self._call("repeat", 0 if self.status().get("repeat") == "1" else 1)
+
+    def set_repeat(self, on: bool) -> None:
+        self._call("repeat", 1 if on else 0)
 
     def toggle_single(self) -> None:
         self._call("single", 0 if self.status().get("single") == "1" else 1)
@@ -272,6 +302,19 @@ class MpdCommander:
     def add(self, uri: str) -> None:
         """Append a file or an entire directory to the queue."""
         self._call("add", uri)
+
+    def replace_queue_with_library(self) -> None:
+        """Clear the queue and load MPD's ENTIRE current library (whatever
+        music_directory's symlink currently resolves to — Internal or USB,
+        whichever the storage-source toggle has active) — used by "Shuffle:
+        All" (see actions.cycle_shuffle_mode), as opposed to the normal
+        folder-scoped queue every browse/enter() call already produces.
+        Starts playback at position 0; the caller is expected to enable
+        random right after, same order play_uri_from_directory uses.
+        """
+        self.clear_queue()
+        self.add("")
+        self.play_position(0)
 
     def play_uri_from_directory(self, directory: str, uri: str) -> None:
         """Replace the queue with ``directory`` and start at ``uri``.

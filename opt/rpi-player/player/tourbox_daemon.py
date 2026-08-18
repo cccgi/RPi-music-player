@@ -35,7 +35,7 @@ from . import mode as _mode
 from .continuous import ContinuousPlayback
 from .ipc import BusServer, NullBus
 from .mpdbus import MpdCommander
-from .outputs import OutputRouter
+from .outputs import AIRPLAY_SAFE_VOLUME, OutputRouter, OutputSafetyWatcher
 from .tourbox.protocol import Decoder, Event, EventKind
 from .video import VideoCommander, VideoLibrary
 from .video_continuous import VideoContinuous
@@ -169,7 +169,41 @@ class TourBoxDaemon:
             enabled=config.video.enabled and config.video.auto_advance,
         )
 
+        # Guards against WirePlumber silently repointing PipeWire's default
+        # sink to AirPlay mid-song (e.g. a Bluetooth device dropping out) at
+        # full volume with no route-switch and no MPD idle event to catch it
+        # on — see OutputRouter.enforce_volume_safety()'s docstring. Lives
+        # here, not the Stream Deck daemon, for the same headless-must-work
+        # reason as _continuous.
+        self._output_safety = OutputSafetyWatcher(
+            self._router, on_tick=self._on_output_safety_tick,
+        )
+
     # -- lifecycle ---------------------------------------------------------
+
+    def _on_output_safety_tick(self, airplay_active: bool) -> None:
+        """Extend the watchdog's MPD-volume clamp to mpv's own mixer.
+
+        ``OutputRouter.enforce_volume_safety()`` (already run by the time
+        this fires) only knows about MPD — it has no reason to import
+        video.py. mpv's softvol is a completely separate mixer (same reason
+        ``_video_finish_route_switch`` in actions.py clamps it separately at
+        route-switch time), so if AirPlay is the live destination AND video
+        mode is the one actually driving audio right now, clamp mpv too.
+        """
+        if not airplay_active or self._video is None:
+            return
+        if _mode.read_mode(self._mode_file) != _mode.VIDEO:
+            return
+        try:
+            current = self._video.volume()
+        except Exception:  # noqa: BLE001 - best-effort; mpv may be idle/unreachable
+            return
+        if current > AIRPLAY_SAFE_VOLUME:
+            LOG.info("clamping video volume %d%% -> %d%% for AirPlay",
+                      current, AIRPLAY_SAFE_VOLUME)
+            self._video.set_volume(AIRPLAY_SAFE_VOLUME)
+            self._ctx.video_last_set_volume = AIRPLAY_SAFE_VOLUME
 
     def stop(self, *_: object) -> None:
         LOG.info("shutting down")
@@ -183,6 +217,7 @@ class TourBoxDaemon:
         LOG.info("tourbox daemon started")
         self._continuous.start()
         self._video_continuous.start()
+        self._output_safety.start()
 
         # MPD's crossfade is runtime-only state, reset to 0 on every mpd.service
         # restart — re-apply it every time this daemon starts so a crossfade
@@ -242,6 +277,7 @@ class TourBoxDaemon:
         self._close_device()
         self._continuous.stop()
         self._video_continuous.stop()
+        self._output_safety.stop()
         self._mpd.close()
         self._bus.stop()
         return 0
