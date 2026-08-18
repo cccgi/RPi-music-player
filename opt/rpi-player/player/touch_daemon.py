@@ -194,10 +194,17 @@ class TouchDaemon:
             video_local_device=config.video.local_audio_device,
         )
 
+        # v3 redesign: the touch UI's palette is now the exact hex spec from
+        # the design doc (see Theme's field defaults in touchui/render.py) —
+        # it deliberately does NOT inherit from config.streamdeck.theme
+        # anymore. The Stream Deck's theme is a different device with a
+        # different set of fields (bg/fg/muted/accent/active/warn) that no
+        # longer line up 1:1 with this dataclass (which replaced `warn` with
+        # per-element accent colors: favorite/scan/danger/accent_video, and
+        # added surface/elevated/border/fg_secondary). Only the font paths
+        # are still worth sharing, since they're just filesystem paths, not
+        # design-language choices.
         theme = Theme(
-            bg=config.streamdeck.theme.bg, fg=config.streamdeck.theme.fg,
-            muted=config.streamdeck.theme.muted, accent=config.streamdeck.theme.accent,
-            active=config.streamdeck.theme.active, warn=config.streamdeck.theme.warn,
             font_regular=config.streamdeck.theme.font_regular,
             font_bold=config.streamdeck.theme.font_bold,
         )
@@ -228,6 +235,11 @@ class TouchDaemon:
         # Content-area gesture lock ("seek" | "volume" | None) — see
         # _GESTURE_DEADZONE and _handle_content_gesture().
         self._gesture: str | None = None
+        # Which action's button is currently held down, if it needs a
+        # visual "pressed" state — currently only Delete's armed-red
+        # warning (design spec: neutral until actually being touched).
+        # See _on_touch_down/_on_touch_up.
+        self._pressed_action: str = ""
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -345,6 +357,16 @@ class TouchDaemon:
         self._down_button = layout.hit_test(self._x, self._y, mode)
         LOG.debug("touch down at (%d, %d) -> %s", self._x, self._y,
                   self._down_button.action if self._down_button else None)
+        # Delete's "armed" red warning state (design spec: DELETE stays
+        # neutral until actually being touched) — tracked as a plain
+        # action-name string rather than a bool so render.py can compare
+        # it against whichever Delete rect is live for the current mode
+        # without touch_daemon needing to know render.py's per-button
+        # visual rules. Cleared unconditionally in _on_touch_up.
+        if self._down_button is not None and self._down_button.action in (
+                "delete_current", "video_delete_current"):
+            self._pressed_action = self._down_button.action
+            self._render_and_push(force=True)
         if self._down_button is not None and self._down_button.action in (
                 "_seek_absolute", "_volume_absolute"):
             self._apply_drag(self._down_button)
@@ -369,8 +391,17 @@ class TouchDaemon:
         self._down_button = None
         gesture = self._gesture
         self._gesture = None
+        was_pressed = bool(self._pressed_action)
+        self._pressed_action = ""
         if button is None:
             return
+        if was_pressed:
+            # Clear Delete's armed-red visual immediately rather than
+            # waiting for the next periodic tick (up to ~1s away per
+            # [touch].tick_seconds) — every early-return below this point
+            # would otherwise leave a stale red button on screen briefly
+            # after the finger lifts.
+            self._render_and_push(force=True)
 
         # If the overlay is currently hidden (auto-hidden or manually
         # hidden), ANY touch just brings it back — swallow it rather than
@@ -575,7 +606,8 @@ class TouchDaemon:
 
     def _collect_state(self) -> OverlayState:
         mode = _mode.read_mode(self._mode_file)
-        state = OverlayState(mode=mode, overlay_visible=self._overlay_visible)
+        state = OverlayState(mode=mode, overlay_visible=self._overlay_visible,
+                              pressed_action=self._pressed_action)
 
         route = self._router.current()
         state.route_icon = route.icon if route else ""
