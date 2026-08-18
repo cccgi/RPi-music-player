@@ -292,6 +292,23 @@ class VideoCommander:
         """
         self.set("audio-device", device)
 
+    def unmute(self) -> None:
+        """Clear mpv's global ``mute`` flag.
+
+        ``mute`` is a player-wide property, not scoped to whatever file is
+        currently loaded — touch_daemon.py's ``_ensure_idle_video()`` sets it
+        True once at startup so the silent DRM-holding idle clip stays
+        silent, and nothing ever set it back. Confirmed live: production
+        mpv reported ``mute: true`` while a real video's PipeWire stream was
+        correctly connected and [active] on the selected sink — routing was
+        never the problem, this leftover flag was silencing the output
+        before it reached PipeWire at all. Call this before any real
+        (non-idle) file starts playing — see ``load_and_play()``, the one
+        place every real playback path (``.skp`` karaoke, plain video,
+        next/prev, resume) already funnels through.
+        """
+        self.set("mute", False)
+
     def play_pause(self) -> None:
         self.command(["cycle", "pause"])
 
@@ -681,6 +698,12 @@ def load_and_play(commander: VideoCommander, entry: VideoEntry,
     0.0) since a fresh load already starts at 0. Works the same for both
     branches: mpv's `seek ... absolute` doesn't care how the file was loaded.
     """
+    # Every real playback path funnels through here — the one place that
+    # needs to undo _ensure_idle_video()'s startup mute (see
+    # VideoCommander.unmute()'s docstring). Unmute BEFORE loadfile so the
+    # very first frame of real audio is never silently dropped waiting for
+    # a later property-set to land.
+    commander.unmute()
     offsets: SkpOffsets | None = None
     if entry.path.lower().endswith(".skp"):
         offsets = parse_skp(entry.path)
