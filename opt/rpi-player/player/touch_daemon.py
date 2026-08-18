@@ -79,6 +79,26 @@ _RELEASE_DEBOUNCE = 0.0
 # sample, which can arrive far faster than the eye needs a redraw.
 _DRAG_RENDER_INTERVAL = 0.05
 
+# Auto-hide: video mode only, per explicit request ("fade and go away after
+# a video starts playing for 2 sec"). Rearmed on every playback-start
+# transition (initial play OR resume from pause), cleared while paused or
+# out of video mode. Implemented as an instant hide rather than an animated
+# alpha fade — the render loop's poll cadence ([touch].tick_seconds, ~1s by
+# default) is too coarse to animate smoothly without pushing a new overlay
+# frame over the mpv IPC socket every video frame, and "goes away" is the
+# behavior that actually matters here, not the transition style.
+_AUTO_HIDE_DELAY = 2.0
+
+# Swipe-to-hide: a touch that starts AND ends in the open content area
+# (CONTENT_AREA — not on a specific control) counts as a swipe, not a tap,
+# if it covers enough distance quickly enough. A swipe starting on a real
+# control (e.g. dragging off the play button) is deliberately NOT treated
+# as a hide gesture, so it can't be triggered by accident while operating
+# a control. Thresholds are reasonable first-pass defaults; tune from real
+# hardware if taps misfire as swipes or vice versa.
+_SWIPE_MIN_DISTANCE = 60   # logical pixels
+_SWIPE_MAX_DURATION = 0.6  # seconds
+
 
 def find_touch_device(explicit_path: str = "") -> "evdev.InputDevice | None":
     """Pick the touchscreen's evdev device.
@@ -189,9 +209,17 @@ class TouchDaemon:
         self._overlay_error_logged = False
         self._overlay_confirmed = False
 
+        # Auto-hide/swipe state — see _AUTO_HIDE_DELAY/_SWIPE_MIN_DISTANCE
+        # module constants and _apply_auto_hide()'s docstring.
+        self._overlay_auto_hide_at: float | None = None
+        self._was_playing_video = False
+
         # touch-state machine
         self._down = False
         self._down_button: layout.Button | None = None
+        self._down_x = 0
+        self._down_y = 0
+        self._down_at = 0.0
         self._x = 0
         self._y = 0
         self._mt_x: int | None = None
@@ -306,6 +334,8 @@ class TouchDaemon:
             return
         self._x, self._y = self._to_logical(self._mt_x, self._mt_y)
         self._down = True
+        self._down_x, self._down_y = self._x, self._y
+        self._down_at = time.monotonic()
         mode = _mode.read_mode(self._mode_file)
         self._down_button = layout.hit_test(self._x, self._y, mode)
         LOG.debug("touch down at (%d, %d) -> %s", self._x, self._y,
@@ -333,9 +363,41 @@ class TouchDaemon:
         if button is None:
             return
 
+        # If the overlay is currently hidden (auto-hidden or swiped away),
+        # ANY tap/gesture just brings it back — swallow it rather than also
+        # dispatching whatever button happens to sit at that screen
+        # location, since the user couldn't see a control was even there.
+        # Per explicit request: "Any tap will bring UI back instantly."
+        if not self._overlay_visible:
+            LOG.info("touch while overlay hidden -> restoring overlay")
+            self._overlay_visible = True
+            # Rearm the auto-hide window from a fresh 2s if video is still
+            # playing, rather than leaving it hidden-again on the very next
+            # tick because the old deadline already passed.
+            self._was_playing_video = False
+            self._render_and_push(force=True)
+            return
+
         if button.action in ("_seek_absolute", "_volume_absolute"):
             self._apply_drag(button)
             return
+
+        # Swipe-to-hide: a fast, large-displacement touch that started AND
+        # ends in the open content area (not on a real control) hides the
+        # overlay for full-screen playback. Checked before the tap-target
+        # logic below since a swipe never lands back on a specific button.
+        if button is layout.CONTENT_AREA:
+            dx = self._x - self._down_x
+            dy = self._y - self._down_y
+            distance = (dx * dx + dy * dy) ** 0.5
+            elapsed = time.monotonic() - self._down_at
+            if distance >= _SWIPE_MIN_DISTANCE and elapsed <= _SWIPE_MAX_DURATION:
+                LOG.info("swipe detected (%.0fpx in %.2fs) -> hiding overlay",
+                          distance, elapsed)
+                self._overlay_visible = False
+                self._overlay_auto_hide_at = None
+                self._render_and_push(force=True)
+                return
 
         # Tap-style buttons only fire if release is still over the SAME
         # button that was pressed — avoids firing e.g. Delete because a
@@ -495,12 +557,40 @@ class TouchDaemon:
 
         return state
 
+    def _apply_auto_hide(self, state: OverlayState) -> None:
+        """Video-mode auto-hide: 2s after playback starts (or resumes from
+        pause), hide the overlay so it doesn't sit over the video
+        indefinitely. Mutates self._overlay_visible and state.overlay_visible
+        in place; called once per render from _render_and_push() so every
+        code path that produces a frame (tick, tap, drag) sees the same
+        up-to-date visibility.
+        """
+        now = time.monotonic()
+        playing_video = state.mode == "video" and state.playing
+        if playing_video and not self._was_playing_video:
+            self._overlay_auto_hide_at = now + _AUTO_HIDE_DELAY
+        elif not playing_video:
+            self._overlay_auto_hide_at = None
+        self._was_playing_video = playing_video
+
+        if (self._overlay_auto_hide_at is not None
+                and now >= self._overlay_auto_hide_at
+                and self._overlay_visible):
+            LOG.info("auto-hiding overlay %.0fs after video playback started",
+                      _AUTO_HIDE_DELAY)
+            self._overlay_visible = False
+            self._overlay_auto_hide_at = None
+
+        state.overlay_visible = self._overlay_visible
+
     def _render_and_push(self, force: bool = False) -> None:
         try:
             state = self._collect_state()
         except Exception:  # noqa: BLE001 - never let a bad status() poll kill the daemon
             LOG.exception("failed to collect state for rendering")
             return
+
+        self._apply_auto_hide(state)
 
         frame = self._renderer.render(state, self._touch.rotate_180)
         self._last_render_at = time.monotonic()

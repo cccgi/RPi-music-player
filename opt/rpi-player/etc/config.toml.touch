@@ -335,8 +335,10 @@ device = ""
 # before handing it to mpv, and touch_daemon.py rotates each raw touch
 # coordinate 180 degrees before hit-testing against touchui/layout.py's
 # button rects. See touchui/layout.py's module docstring for the exact
-# contract. Set false if the panel is ever remounted right-side up.
-rotate_180 = true
+# contract. Confirmed live on the actual mounted panel: this Pi's physical
+# mounting reads correctly right-side-up with rotate_180 = false — flip to
+# true only if a panel is ever mounted the other way around.
+rotate_180 = false
 
 # Where the rendered BGRA bitmap is written before each overlay-add call.
 # Deliberately inside video-mpv.service's OWN RuntimeDirectory
