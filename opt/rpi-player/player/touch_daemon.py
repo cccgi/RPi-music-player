@@ -35,6 +35,7 @@ Run standalone for debugging:
 from __future__ import annotations
 
 import argparse
+import io
 import logging
 import math
 import os
@@ -43,6 +44,8 @@ import signal
 import sys
 import time
 from pathlib import Path
+
+from PIL import Image, UnidentifiedImageError
 
 from .actions import (
     ActionContext,
@@ -99,6 +102,13 @@ _AUTO_HIDE_DELAY = 2.0
 # with a little natural finger wobble doesn't misfire as a 1%-volume-change
 # swipe.
 _GESTURE_DEADZONE = 14  # logical pixels
+
+# How long the transient volume HUD (render.py's _draw_volume_hud) stays
+# visible after the most recent volume-swipe sample — re-armed on every
+# sample during an active swipe (see _handle_content_gesture), so it only
+# starts counting down once the finger actually stops/lifts. Per the spec:
+# "automatically disappear after approximately 1-2 seconds."
+_VOLUME_HUD_HOLD = 1.5
 
 
 def find_touch_device(explicit_path: str = "") -> "evdev.InputDevice | None":
@@ -241,6 +251,20 @@ class TouchDaemon:
         # See _on_touch_down/_on_touch_up.
         self._pressed_action: str = ""
 
+        # Transient volume HUD deadline (monotonic time) — see
+        # _VOLUME_HUD_HOLD, _handle_content_gesture, and _apply_volume_hud.
+        # 0.0 (the default) is always "expired" since time.monotonic() is
+        # never negative, so the HUD starts hidden with no special-casing.
+        self._volume_hud_until: float = 0.0
+
+        # Real album-art cache, keyed by MPD song file path — decoded once
+        # per track (touch_daemon._get_album_art), not re-fetched every
+        # render tick. Capped crudely (see _get_album_art) so leaving the
+        # daemon running for weeks browsing a huge library can't grow this
+        # without bound; a full LRU wasn't judged worth the complexity for
+        # a cache of ~168x168 thumbnails.
+        self._art_cache: dict[str, "Image.Image | None"] = {}
+
     # -- lifecycle -----------------------------------------------------------
 
     def stop(self, *_: object) -> None:
@@ -367,16 +391,14 @@ class TouchDaemon:
                 "delete_current", "video_delete_current"):
             self._pressed_action = self._down_button.action
             self._render_and_push(force=True)
-        if self._down_button is not None and self._down_button.action in (
-                "_seek_absolute", "_volume_absolute"):
+        if self._down_button is not None and self._down_button.action == "_seek_absolute":
             self._apply_drag(self._down_button)
 
     def _on_position_update(self) -> None:
         if not self._down or self._mt_x is None or self._mt_y is None:
             return
         self._x, self._y = self._to_logical(self._mt_x, self._mt_y)
-        if self._down_button is not None and self._down_button.action in (
-                "_seek_absolute", "_volume_absolute"):
+        if self._down_button is not None and self._down_button.action == "_seek_absolute":
             now = time.monotonic()
             if now - self._last_render_at >= _DRAG_RENDER_INTERVAL:
                 self._apply_drag(self._down_button)
@@ -421,7 +443,7 @@ class TouchDaemon:
             self._render_and_push(force=True)
             return
 
-        if button.action in ("_seek_absolute", "_volume_absolute"):
+        if button.action == "_seek_absolute":
             self._apply_drag(button)
             return
 
@@ -453,10 +475,9 @@ class TouchDaemon:
         self._render_and_push(force=True)
 
     def _apply_drag(self, button: layout.Button) -> None:
-        """Absolute-position drag on a dedicated bar (SCRUB_BAR or
-        VOLUME_BAR — the v2 mockup brought a real volume bar back
-        alongside the swipe-anywhere content gesture, which still works
-        too; they're independent, not mutually exclusive).
+        """Absolute-position drag on a dedicated bar (SCRUB_BAR — VOLUME_BAR
+        was removed in v4; volume is swipe-only now, see
+        _handle_content_gesture and layout.py's module docstring item 2).
         """
         rect = button.rect
         fraction = (self._x - rect[0]) / max(1, rect[2])
@@ -472,16 +493,6 @@ class TouchDaemon:
                     LOG.debug("video seek_absolute failed", exc_info=True)
             else:
                 self._mpd.seek_absolute(fraction)
-        elif button.action == "_volume_absolute":
-            volume = int(round(fraction * 100))
-            if mode == "video" and self._video is not None:
-                try:
-                    self._video.set_volume(volume)
-                    self._ctx.video_last_set_volume = volume
-                except Exception:  # noqa: BLE001
-                    LOG.debug("video set_volume failed", exc_info=True)
-            else:
-                self._mpd.set_volume(volume)
 
         self._render_and_push()
 
@@ -534,6 +545,11 @@ class TouchDaemon:
                     LOG.debug("video set_volume (gesture) failed", exc_info=True)
             else:
                 self._mpd.set_volume(volume)
+            # Show the transient volume HUD (see _apply_volume_hud) for a
+            # bit after the most recent change — re-armed on every sample
+            # so it stays up for the whole swipe, then counts down once the
+            # finger stops moving/lifts.
+            self._volume_hud_until = now + _VOLUME_HUD_HOLD
 
         self._render_and_push()
 
@@ -664,8 +680,60 @@ class TouchDaemon:
             state.curated = bool(song_file) and "Curated" in Path(song_file).parts
             state.meta_line = _album_meta_line(song)
             state.tags = _music_format_tags(song_file, mstat.get("audio", ""))
+            state.art_image = self._get_album_art(song_file) if song_file else None
 
         return state
+
+    def _get_album_art(self, song_file: str) -> "Image.Image | None":
+        """Real album art for the art panel (render.py's module docstring,
+        item 1) — cached per file path so this only hits MPD once per
+        track, not once per render tick. Returns a pre-cropped-to-square
+        RGBA thumbnail, or None (cached too, so a track with no art isn't
+        re-queried every tick either).
+
+        Every failure mode here — no art embedded, MPD too old for
+        readpicture/albumart, a corrupt/undecodable image blob — is
+        treated as "no art", never an error: falling back to the
+        placeholder icon is always a safe, expected outcome, matching how
+        the rest of this module treats optional metadata (format tags,
+        meta_line, etc).
+        """
+        if song_file in self._art_cache:
+            return self._art_cache[song_file]
+
+        if len(self._art_cache) > 200:
+            # Crude unbounded-growth guard (see __init__) rather than a
+            # real LRU — simplest thing that keeps a long-running daemon
+            # browsing a big library from accumulating thumbnails forever.
+            LOG.debug("album art cache exceeded 200 entries — clearing")
+            self._art_cache.clear()
+
+        art: "Image.Image | None" = None
+        try:
+            data = self._mpd.album_art(song_file)
+            if data:
+                img = Image.open(io.BytesIO(data))
+                img.load()  # force full decode now, inside this try/except
+                img = img.convert("RGBA")
+                art = _center_crop_square(img)
+        except (UnidentifiedImageError, OSError, ValueError):
+            LOG.debug("album art for %r fetched but could not be decoded", song_file, exc_info=True)
+        except Exception:  # noqa: BLE001 - never let a bad cover art blob affect playback
+            LOG.debug("album art fetch failed for %r", song_file, exc_info=True)
+
+        self._art_cache[song_file] = art
+        return art
+
+    def _apply_volume_hud(self, state: OverlayState) -> None:
+        """Mirror self._volume_hud_until (set on every volume-swipe sample,
+        see _handle_content_gesture) into state.volume_hud_visible. Called
+        once per render, same pattern as _apply_auto_hide — every code path
+        that produces a frame (tick, tap, drag) sees the same up-to-date
+        visibility, and the periodic tick in run() is what actually causes
+        the HUD to disappear once its hold window elapses (no dedicated
+        timer thread needed, same tradeoff _apply_auto_hide already makes).
+        """
+        state.volume_hud_visible = time.monotonic() < self._volume_hud_until
 
     def _video_format_tags(self) -> list[str]:
         """Resolution/codec/aspect/fps chips for the header — mirrors the
@@ -737,6 +805,7 @@ class TouchDaemon:
             return
 
         self._apply_auto_hide(state)
+        self._apply_volume_hud(state)
 
         frame = self._renderer.render(state, self._touch.rotate_180)
         self._last_render_at = time.monotonic()
@@ -780,7 +849,24 @@ class TouchDaemon:
             LOG.debug("overlay push failed (mpv not reachable?)", exc_info=True)
 
 
-# -- format-tag / meta-line helpers (module-level: no daemon state needed) ---
+# -- format-tag / meta-line / art helpers (module-level: no daemon state needed) --
+
+def _center_crop_square(img: "Image.Image") -> "Image.Image":
+    """Crop the larger dimension down so the image is square, centered —
+    most embedded cover art already is square, but this guards against the
+    occasional oddly-cropped or panorama-shaped embedded image looking
+    stretched in the (also square) art panel. render.py resizes the result
+    to the panel's exact pixel size separately; this only fixes aspect
+    ratio.
+    """
+    w, h = img.size
+    if w == h:
+        return img
+    side = min(w, h)
+    left = (w - side) // 2
+    top = (h - side) // 2
+    return img.crop((left, top, left + side, top + side))
+
 
 def _album_meta_line(song: dict) -> str:
     """"Album (Year)" line under the artist, music mode only — matches the

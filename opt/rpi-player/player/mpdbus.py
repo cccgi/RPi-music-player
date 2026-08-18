@@ -281,6 +281,68 @@ class MpdCommander:
         """
         self._call("deleteid", song_id)
 
+    def album_art(self, uri: str) -> bytes | None:
+        """Fetch embedded cover art for ``uri`` (a song file path relative to
+        MPD's music_directory), or None if there isn't any / it can't be
+        fetched. Used by the touch UI to show real album art instead of the
+        generic music-note placeholder (see touch_daemon.py's
+        ``_get_album_art`` — this method only speaks MPD's binary protocol
+        and returns raw bytes; decoding/resizing/caching lives there).
+
+        Tries ``readpicture`` first (picture embedded in the file's own
+        tags — ID3 APIC, FLAC PICTURE block, etc.), then falls back to
+        ``albumart`` (a cover file sitting next to the track, e.g.
+        cover.jpg) since either can be present without the other. Both
+        commands are chunked: MPD returns at most ``binarylimit`` bytes per
+        call plus a ``size`` field for the total, so this loops on
+        increasing ``offset`` until every chunk has been collected.
+
+        Deliberately does NOT go through the shared ``_call`` retry wrapper
+        for the whole multi-chunk fetch (only per-chunk) — a reconnect
+        mid-fetch would otherwise silently return a half-assembled image.
+        Any failure (missing art, older MPD without these commands, a
+        protocol error, a python-mpd2 version too old to have grown the
+        methods at all) returns None; callers already treat "no art" as the
+        normal/expected case, matching how python-mpd2 auto-generates these
+        methods only for commands the *client* declares, not the server, so
+        an AttributeError here just means an old python-mpd2, not a broken
+        install.
+        """
+        for command in ("readpicture", "albumart"):
+            data = self._fetch_binary(command, uri)
+            if data:
+                return data
+        return None
+
+    def _fetch_binary(self, command: str, uri: str) -> bytes | None:
+        chunks: list[bytes] = []
+        offset = 0
+        total_size: int | None = None
+        while True:
+            try:
+                reply = self._call(command, uri, offset)
+            except AttributeError:
+                # This python-mpd2 build never learned this command.
+                return None
+            if not isinstance(reply, dict) or "binary" not in reply:
+                return None
+            chunk = reply["binary"]
+            if not chunk:
+                break
+            chunks.append(chunk)
+            offset += len(chunk)
+            if total_size is None:
+                try:
+                    total_size = int(reply.get("size", offset))
+                except (TypeError, ValueError):
+                    total_size = offset
+            if offset >= total_size:
+                break
+            if len(chunks) > 64:  # ~64 * binarylimit — a corrupt/huge cover
+                LOG.warning("album art fetch for %r exceeded 64 chunks — aborting", uri)
+                return None
+        return b"".join(chunks) if chunks else None
+
     def music_directory(self) -> str | None:
         """Ask MPD where its library root is.
 

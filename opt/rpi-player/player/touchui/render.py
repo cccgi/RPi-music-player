@@ -3,44 +3,72 @@ composites over whatever it's currently showing (idle/black in music mode,
 a real frame in video mode) via IPC ``overlay-add``.
 
 --------------------------------------------------------------------------
-v3: control HIERARCHY + restrained "premium hardware" palette
+v4: real album art, volume off the bottom bar, Scan out of the transport row
 --------------------------------------------------------------------------
-v2 gave every control the same bright filled-pill treatment ("looks like a
-basic prototype... every control looks like a variation of the same
-generic pill button" — the explicit complaint that triggered this pass).
-v3 follows a detailed design spec built around a supplied reference
-mockup, with three real differences from v2:
+Three changes on top of v3's size/color hierarchy, from a round of
+feedback given after seeing v3 running on real hardware:
 
-  1. SIZE hierarchy: Play/Pause is a large, clearly dominant circle;
-     Previous/Next are mid-sized pills; Favorite/Scan/Delete are small
-     icon-only squares (see touchui/layout.py's module docstring for the
-     exact rects and reasoning — this file just draws what that file
-     positions).
-  2. COLOR hierarchy: color is used SPARINGLY. Most surfaces are dark
-     neutral gray (Theme.surface/elevated); only a handful of elements
-     ever get an accent color (the mode pill, an actively-connected route
-     pill, Play, Favorite, the Scan/"Playlist"-slot button, Karaoke, and
-     Delete ONLY while actually being held down — see
-     touch_daemon.py's ``_pressed_action`` and the module docstring in
-     layout.py for why Delete stays neutral until touched).
-  3. Glow is reserved for Play alone, and kept subtle (a single soft
-     halo, not the punchier multi-layer version from the previous pass).
+  1. REAL ALBUM ART. MUSIC mode now fetches and displays the track's own
+     embedded cover art (via MpdCommander.album_art -> MPD's
+     readpicture/albumart binary protocol) instead of always drawing the
+     generic music-note placeholder — touch_daemon.py decodes, center-crops
+     and caches it per file path, then hands this file a ready-to-paste
+     ``state.art_image`` (a PIL Image or None). This file just draws
+     whichever one it's given: real art if present, the placeholder icon
+     otherwise (missing art is the normal case for plenty of files, not an
+     error). VIDEO mode still uses the film-icon placeholder — a live
+     frame-grab thumbnail would need an ffmpeg subprocess per file with its
+     own caching, a meaningfully bigger and riskier addition than an MPD
+     binary-protocol call; flagged as a follow-up, not attempted here.
 
-VIDEO mode stays translucent — the ORIGINAL request that predates this
-design spec ("I need this UI to be wireframe... so I can see through the
-video being played") still applies there, since the actual video is
-playing full-screen underneath the overlay in that mode; the supplied
-spec doesn't address that constraint (it's a generic media-player brief,
-not aware of the mpv-overlay architecture this app is built on), so this
-file keeps making that same explicit trade-off: MUSIC mode is fully
-opaque (nothing plays behind it — mpv just holds a muted idle-black clip,
-so there's nothing to preserve visibility of), VIDEO mode stays
-translucent. Every draw call takes an ``opaque`` bool for this reason.
+  2. VOLUME BAR REMOVED FROM THE BOTTOM. Replaced by two independent
+     displays instead of one persistent draggable bar (see
+     touchui/layout.py's module docstring, item 2, for the full
+     reasoning): a small always-on readout in the header
+     (_draw_volume_compact, VOLUME_COMPACT_RECT — icon + tick bars + "NN%")
+     and a bigger transient centered HUD that appears only while a volume
+     swipe is live or has just ended (_draw_volume_hud, VOLUME_HUD_RECT),
+     then fades out of the render entirely once
+     ``state.volume_hud_visible`` goes False (touch_daemon.py owns the
+     ~1.5s timer). The HUD draws OUTSIDE the ``state.overlay_visible``
+     gate, on purpose — a volume swipe while the rest of the UI is
+     auto-hidden (video mode) should still show feedback, the same way a
+     phone shows its volume HUD over a video that's otherwise chrome-free.
 
-No real album art / video-frame thumbnail is fetched (needs MPD's
-`albumart`/`readpicture` binary protocol, or an ffmpeg frame grab for
-video, with its own caching — scoped out, flagged as a follow-up). The
-"visualizer" is likewise NOT real spectrum analysis — this daemon has no
+  3. SCAN MOVED OUT OF THE TRANSPORT ROW into the header's status cluster
+     as a small circular utility icon, specifically so it's no longer
+     adjacent to DELETE (flagged this round as "a dangerous UI collision").
+     See layout.py's SCAN_UTIL[_V] and this file's _draw_scan_util.
+
+  1a. (carried over from v3) SIZE hierarchy: Play/Pause is a large,
+      clearly dominant circle; Previous/Next are mid-sized pills;
+      Favorite/Delete are small icon-only squares (see touchui/layout.py's
+      module docstring for the exact rects and reasoning — this file just
+      draws what that file positions).
+  1b. COLOR hierarchy: color is used SPARINGLY. Most surfaces are dark
+      neutral gray (Theme.surface/elevated); only a handful of elements
+      ever get an accent color (the mode pill, an actively-connected route
+      pill, Play, Favorite, Scan, Karaoke, and Delete ONLY while actually
+      being held down — see touch_daemon.py's ``_pressed_action`` and the
+      module docstring in layout.py for why Delete stays neutral until
+      touched).
+  1c. Glow is reserved for Play alone, and kept subtle (a single soft
+      halo, not a multi-layer neon effect).
+
+VIDEO mode stays translucent — the ORIGINAL request that predates the
+v3/v4 design specs ("I need this UI to be wireframe... so I can see
+through the video being played") still applies there, since the actual
+video is playing full-screen underneath the overlay in that mode; neither
+spec addresses that constraint (both are generic media-player briefs, not
+aware of the mpv-overlay architecture this app is built on), so this file
+keeps making that same explicit trade-off: MUSIC mode is fully opaque
+(nothing plays behind it — mpv just holds a muted idle-black clip, so
+there's nothing to preserve visibility of), VIDEO mode stays translucent.
+Every draw call takes an ``opaque`` bool for this reason. VIDEO mode also
+never shows the decorative visualizer (spec: video prioritizes the video
+image itself, not audio-style decoration) — see render()'s mode check.
+
+The "visualizer" is NOT real spectrum analysis — this daemon has no
 access to decoded audio samples, only MPD/mpv's transport status — so
 rather than fake a live FFT it draws a stylized, deterministic bar
 pattern derived from elapsed playback time, purely decorative, and never
@@ -104,6 +132,8 @@ class OverlayState:
     vocal_active: bool = True           # video mode only: True=Vocal, False=Karaoke
     overlay_visible: bool = True        # whole overlay hidden -> render fully transparent
     pressed_action: str = ""            # action name of the currently-held-down button, if any
+    art_image: object = None            # PIL.Image (RGBA) or None -- see module docstring, item 1
+    volume_hud_visible: bool = False    # transient volume HUD -- see module docstring, item 2
 
 
 def _hex_rgba(h: str, alpha: int = 255) -> tuple[int, int, int, int]:
@@ -138,18 +168,27 @@ class Renderer:
     def render(self, state: OverlayState, rotate_180: bool) -> bytes:
         """Return raw BGRA bytes, W*H*4, ready for mpv's overlay-add."""
         img = Image.new("RGBA", (layout.W, layout.H), (0, 0, 0, 0))
+        opaque = state.mode == "music"
+        accent = self._theme.accent_video if state.mode == "video" else self._theme.accent
         if state.overlay_visible:
-            opaque = state.mode == "music"
-            accent = self._theme.accent_video if state.mode == "video" else self._theme.accent
             if opaque:
                 self._draw_backdrop(img)
             draw = ImageDraw.Draw(img)
-            self._draw_art_panel(draw, state, accent, opaque)
+            self._draw_art_panel(draw, img, state, accent, opaque)
             self._draw_header(draw, state, accent, opaque)
-            self._draw_visualizer(draw, state, accent)
+            if state.mode == "music":
+                # Video mode never shows the visualizer -- it prioritizes
+                # the video image itself (see module docstring, VIDEO mode
+                # paragraph).
+                self._draw_visualizer(draw, state, accent)
             self._draw_scrub(draw, state, accent, opaque)
             self._draw_transport(img, draw, state, accent, opaque)
-            self._draw_volume(draw, state, accent, opaque)
+            self._draw_volume_compact(draw, state, accent, opaque)
+        if state.volume_hud_visible:
+            # Drawn OUTSIDE the overlay_visible gate on purpose -- see
+            # module docstring, item 2.
+            draw = ImageDraw.Draw(img)
+            self._draw_volume_hud(img, draw, state, accent)
         if rotate_180:
             img = img.transpose(Image.ROTATE_180)
         # mpv's overlay-add "bgra" format wants byte order B,G,R,A per
@@ -256,25 +295,45 @@ class Renderer:
 
     # -- album art panel ---------------------------------------------------------
 
-    def _draw_art_panel(self, draw, state: OverlayState, accent: str, opaque: bool) -> None:
-        """No real album art / video thumbnail fetch yet (see module
-        docstring) — a themed rounded panel with a music-note or film-reel
-        icon stands in for it, plus the heart badge the mockup overlays on
-        the art's corner (also a real, tappable curate button — see
-        layout.ART_BADGE).
+    def _draw_art_panel(self, draw, img: Image.Image, state: OverlayState, accent: str, opaque: bool) -> None:
+        """Real album art when MUSIC mode has it (state.art_image — a PIL
+        Image decoded/center-cropped by touch_daemon.py's
+        _get_album_art, see module docstring item 1); otherwise a themed
+        rounded panel with a music-note or film-reel icon stands in, plus
+        the heart badge the mockup overlays on the art's corner (also a
+        real, tappable curate button — see layout.ART_BADGE).
         """
         t = self._theme
         x, y, w, h = layout.ART_RECT
         panel_alpha = 255 if opaque else 200
-        draw.rounded_rectangle([x, y, x + w, y + h], radius=16,
-                                fill=_hex_rgba(t.elevated, panel_alpha),
-                                outline=_hex_rgba(t.border, 220), width=2)
-        cx, cy = x + w / 2, y + h / 2
-        icon_alpha = 220 if opaque else 190
-        if state.mode == "video":
-            _icon_film(draw, cx, cy, w * 0.2, _hex_rgba(accent, icon_alpha))
+
+        if state.mode == "music" and state.art_image is not None:
+            art = state.art_image
+            if art.mode != "RGBA":
+                art = art.convert("RGBA")
+            if art.size != (w, h):
+                art = art.resize((w, h), Image.LANCZOS)
+            # Rounded-corner mask so real art matches the placeholder
+            # panel's rounded look instead of pasting a hard-edged square.
+            mask = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(mask).rounded_rectangle([0, 0, w, h], radius=16, fill=255)
+            if opaque:
+                img.paste(art.convert("RGB"), (x, y), mask)
+            else:
+                faded = art.copy()
+                faded.putalpha(Image.eval(faded.getchannel("A"), lambda a: int(a * 0.78)))
+                img.alpha_composite(Image.composite(faded, Image.new("RGBA", (w, h), (0, 0, 0, 0)), mask), (x, y))
+            draw.rounded_rectangle([x, y, x + w, y + h], radius=16, outline=_hex_rgba(t.border, 220), width=2)
         else:
-            _icon_music_note(draw, cx, cy, w * 0.2, _hex_rgba(accent, icon_alpha))
+            draw.rounded_rectangle([x, y, x + w, y + h], radius=16,
+                                    fill=_hex_rgba(t.elevated, panel_alpha),
+                                    outline=_hex_rgba(t.border, 220), width=2)
+            cx, cy = x + w / 2, y + h / 2
+            icon_alpha = 220 if opaque else 190
+            if state.mode == "video":
+                _icon_film(draw, cx, cy, w * 0.2, _hex_rgba(accent, icon_alpha))
+            else:
+                _icon_music_note(draw, cx, cy, w * 0.2, _hex_rgba(accent, icon_alpha))
 
         # heart badge, top-left corner of the art
         bx, by, bw, bh = layout.ART_BADGE.rect
@@ -309,6 +368,8 @@ class Renderer:
         self._source_pill(draw, layout.AIRPLAY_PILL.rect, _icon_airplay, "AP", opaque=opaque,
                            active=state.route_icon == "airplay",
                            muted=not state.airplay_available and state.route_icon != "airplay")
+        scan_rect = layout.SCAN_UTIL_V.rect if state.mode == "video" else layout.SCAN_UTIL.rect
+        self._scan_util_btn(draw, scan_rect, opaque=opaque)
         # Bumped from muted/200/r=2.2 -- on the actual DSI panel (per a
         # hardware photo) this landed almost invisible next to the
         # source pills' higher-contrast fills. fg_secondary + slightly
@@ -357,6 +418,22 @@ class Renderer:
         icon_cx = x + 12 + icon_s * 0.5
         icon_fn(draw, icon_cx, y + h / 2, icon_s, fg)
         draw.text((icon_cx + icon_s * 1.15, y + h / 2), text, font=self._font_tag, fill=fg, anchor="lm")
+
+    def _scan_util_btn(self, draw, rect, opaque) -> None:
+        """Small circular rescan/refresh icon in the header's status
+        cluster — v4 moved this out of the transport row specifically so
+        it's not adjacent to Delete (see module docstring, item 3). A
+        library-scope action (not a per-track control), so it lives with
+        the other status/utility controls rather than the playback ones.
+        """
+        t = self._theme
+        x, y, w, h = rect
+        r = min(w, h) / 2
+        cx, cy = x + w / 2, y + h / 2
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                     outline=_hex_rgba(t.border, 220 if opaque else 90),
+                     width=2, fill=_hex_rgba(t.elevated, 220 if opaque else 55))
+        _scan_glyph(draw, cx, cy, r * 0.6, _hex_rgba(t.scan, 235))
 
     # -- decorative "spectrum" strip -----------------------------------------------
 
@@ -426,15 +503,15 @@ class Renderer:
         prev_rect = layout.PREV_BTN_V.rect if video else layout.PREV_BTN.rect
         play_rect = layout.PLAY_BTN_V.rect if video else layout.PLAY_BTN.rect
         next_rect = layout.NEXT_BTN_V.rect if video else layout.NEXT_BTN.rect
-        scan_rect = layout.SCAN_ICON_V.rect if video else layout.SCAN_ICON.rect
         delete_rect = layout.DELETE_BTN_V.rect if video else layout.DELETE_BTN.rect
         delete_action = "video_delete_current" if video else "delete_current"
 
-        # tertiary: icon-only, subordinate
+        # tertiary: icon-only, subordinate. Scan/rescan is NOT here in v4
+        # — see module docstring item 3 and _scan_util_btn (drawn in the
+        # header instead), specifically to keep it away from Delete.
         self._tertiary_icon_btn(draw, curate_rect,
                                  lambda d, cx, cy, s, fg: _heart_glyph(d, cx, cy, s, fg, filled=state.curated),
                                  accent=t.favorite, active=state.curated, opaque=opaque)
-        self._tertiary_icon_btn(draw, scan_rect, _scan_glyph, accent=t.scan, active=True, opaque=opaque)
         self._tertiary_icon_btn(draw, delete_rect, _icon_trash, armed=state.pressed_action == delete_action,
                                  opaque=opaque)
 
@@ -468,25 +545,75 @@ class Renderer:
             draw.polygon([(cx - s * 0.55, cy - s), (cx - s * 0.55, cy + s), (cx + s * 0.95, cy)],
                          fill=_hex_rgba(t.fg))
 
-    # -- volume row ----------------------------------------------------------------
+    # -- volume: compact persistent readout + transient swipe HUD ------------------
+    # v4 removed the old full-width bottom VOLUME_BAR — see layout.py's module
+    # docstring item 2. Two independent displays replace it: a tiny always-on
+    # readout in the header (below), and a bigger transient card
+    # (_draw_volume_hud) that only appears while a volume swipe is live/just
+    # ended. Neither is draggable; swipe-anywhere-in-the-content-area (see
+    # touch_daemon.py's _handle_content_gesture) is the only volume input now.
 
-    def _draw_volume(self, draw, state: OverlayState, accent: str, opaque: bool) -> None:
+    def _draw_volume_compact(self, draw, state: OverlayState, accent: str, opaque: bool) -> None:
+        """Small header readout: speaker icon + a handful of tick bars +
+        "NN%". Always visible, never a drag target — matches the spec's
+        "speaker icon + 3-5 tiny bars + percentage" example.
+        """
         t = self._theme
-        vx, vy, vw, vh = layout.VOLUME_BAR.rect
-        track_y = vy + vh / 2
-        _icon_speaker(draw, vx - 30, track_y, vh * 0.9, _hex_rgba(t.fg_secondary, 220),
+        x, y, w, h = layout.VOLUME_COMPACT_RECT
+        cy = y + h / 2
+        icon_s = h * 0.42
+        icon_cx = x + icon_s * 0.6
+        _icon_speaker(draw, icon_cx, cy, icon_s, _hex_rgba(t.fg_secondary, 220),
                       muted=state.volume <= 0)
 
-        draw.line([(vx, track_y), (vx + vw, track_y)], fill=_hex_rgba(t.border, 220), width=3)
-        vfrac = max(0.0, min(1.0, state.volume / 100.0))
-        vfill_x = vx + vw * vfrac
-        if vfrac > 0:
-            draw.line([(vx, track_y), (vfill_x, track_y)], fill=_hex_rgba(accent, 255), width=3)
-        draw.ellipse([vfill_x - 6, track_y - 6, vfill_x + 6, track_y + 6],
-                     fill=_hex_rgba(t.fg), outline=_hex_rgba(accent, 255), width=2)
+        n_ticks = 5
+        tick_w = 4
+        gap = 4
+        ticks_x = icon_cx + icon_s * 1.3
+        filled_ticks = round((state.volume / 100.0) * n_ticks)
+        for i in range(n_ticks):
+            tx = ticks_x + i * (tick_w + gap)
+            tick_h = h * (0.35 + 0.13 * i)
+            color = accent if i < filled_ticks else t.border
+            draw.rounded_rectangle([tx, cy - tick_h / 2, tx + tick_w, cy + tick_h / 2],
+                                    radius=1.5, fill=_hex_rgba(color, 235 if opaque else 120))
+
+        pct_x = ticks_x + n_ticks * (tick_w + gap) + 8
+        draw.text((pct_x, cy), f"{state.volume}%", font=self._font_tag,
+                  fill=_hex_rgba(t.fg_secondary, 230), anchor="lm")
+
+    def _draw_volume_hud(self, img: Image.Image, draw, state: OverlayState, accent: str) -> None:
+        """Transient centered card, shown only while
+        ``state.volume_hud_visible`` (touch_daemon.py owns the ~1.5s timer
+        that flips it back off). Drawn outside the overlay_visible gate in
+        render() — see that method's comment — so it can surface even when
+        the rest of the UI is auto-hidden.
+        """
+        t = self._theme
+        x, y, w, h = layout.VOLUME_HUD_RECT
+        cx = x + w / 2
+        # Own soft backdrop card, opaque enough to read over a live video
+        # frame regardless of what's playing underneath.
+        draw.rounded_rectangle([x, y, x + w, y + h], radius=20,
+                                fill=_hex_rgba(t.elevated, 235),
+                                outline=_hex_rgba(t.border, 230), width=2)
+        icon_cy = y + h * 0.36
+        _icon_speaker(draw, cx - w * 0.28, icon_cy, h * 0.22, _hex_rgba(t.fg, 255),
+                      muted=state.volume <= 0)
         pct = f"{state.volume}%"
-        self._shadowed_text(draw, (vx + vw + 12, track_y - 8), pct, self._font_time,
-                             _hex_rgba(t.fg_secondary, 220))
+        pw = draw.textlength(pct, font=self._font_title)
+        draw.text((cx - pw * 0.15, icon_cy), pct, font=self._font_title,
+                  fill=_hex_rgba(t.fg, 255), anchor="lm")
+
+        # thin fill bar along the bottom of the card, same visual language
+        # as the scrub bar
+        bar_x0, bar_x1 = x + 24, x + w - 24
+        bar_y = y + h * 0.74
+        draw.line([(bar_x0, bar_y), (bar_x1, bar_y)], fill=_hex_rgba(t.border, 220), width=4)
+        vfrac = max(0.0, min(1.0, state.volume / 100.0))
+        fill_x = bar_x0 + (bar_x1 - bar_x0) * vfrac
+        if vfrac > 0:
+            draw.line([(bar_x0, bar_y), (fill_x, bar_y)], fill=_hex_rgba(accent, 255), width=4)
 
 
 # -- standalone vector icon helpers (module-level: no per-button state needed) --
