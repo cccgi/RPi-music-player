@@ -309,7 +309,11 @@ class Renderer:
         self._source_pill(draw, layout.AIRPLAY_PILL.rect, _icon_airplay, "AP", opaque=opaque,
                            active=state.route_icon == "airplay",
                            muted=not state.airplay_available and state.route_icon != "airplay")
-        _menu_dots(draw, layout.MENU_DOTS_RECT, _hex_rgba(t.muted, 200))
+        # Bumped from muted/200/r=2.2 -- on the actual DSI panel (per a
+        # hardware photo) this landed almost invisible next to the
+        # source pills' higher-contrast fills. fg_secondary + slightly
+        # bigger dots keeps it a quiet decorative element, just legible.
+        _menu_dots(draw, layout.MENU_DOTS_RECT, _hex_rgba(t.fg_secondary, 220))
 
         title_x = layout.MODE_PILL.rect[0]
         title = state.title or ("Nothing playing" if state.mode == "music" else "No video loaded")
@@ -629,7 +633,7 @@ def _menu_dots(draw, rect, fg) -> None:
     """
     x, y, w, h = rect
     cx = x + w / 2
-    r = 2.2
+    r = 2.8
     for i, f in enumerate((0.28, 0.5, 0.72)):
         cy = y + h * f
         draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=fg)
