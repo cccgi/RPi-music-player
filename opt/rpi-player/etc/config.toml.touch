@@ -348,9 +348,11 @@ rotate_180 = true
 # directory; video-mpv.service is the one that creates and owns it.
 overlay_path = "/run/rpi-player-video/overlay.bgra"
 
-# mpv overlay-add's id parameter. Arbitrary but must not collide with any
-# other overlay id this project ever adds — there is currently only this one.
-overlay_id = 90210
+# mpv overlay-add's id parameter — NOT arbitrary. It indexes a small
+# fixed-size internal slot array; found live that 90210 (picked to "obviously
+# not collide") was rejected outright with "overlay-add: invalid id 90210".
+# Only one overlay is ever needed here, so 0 is deliberately boring.
+overlay_id = 0
 
 # Re-render on this interval even with no touch input, so the elapsed-time
 # readout and scrub bar keep advancing during playback (same idea as

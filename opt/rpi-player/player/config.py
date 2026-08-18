@@ -241,7 +241,12 @@ class TouchConfig:
     # touch-ui-player.service's comment on the multi-owner RuntimeDirectory
     # teardown race this project already hit once.
     overlay_path: str = "/run/rpi-player-video/overlay.bgra"
-    overlay_id: int = 90210
+    # mpv's overlay-add ids are NOT arbitrary — they index a small fixed-size
+    # internal slot array (found live: id 90210, picked purely to "obviously
+    # not collide with anything", was rejected outright with "overlay-add:
+    # invalid id 90210"). This project only ever needs exactly one overlay,
+    # so 0 is deliberately boring and always in range.
+    overlay_id: int = 0
     tick_seconds: float = 1.0
     # A muted, looping, near-zero-size black clip touch_daemon loads into
     # mpv at startup, purely to force mpv to actually claim the DSI panel's
@@ -516,7 +521,7 @@ def load_config(path: Path | None = None) -> Config:
         device=touch_raw.get("device", ""),
         rotate_180=bool(touch_raw.get("rotate_180", True)),
         overlay_path=touch_raw.get("overlay_path", "/run/rpi-player-video/overlay.bgra"),
-        overlay_id=int(touch_raw.get("overlay_id", 90210)),
+        overlay_id=int(touch_raw.get("overlay_id", 0)),
         tick_seconds=float(touch_raw.get("tick_seconds", 1.0)),
         idle_clip_path=touch_raw.get("idle_clip_path", "/opt/rpi-player/assets/idle-black.mp4"),
     )
