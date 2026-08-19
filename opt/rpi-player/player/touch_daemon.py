@@ -262,6 +262,11 @@ class TouchDaemon:
         self._y = 0
         self._mt_x: int | None = None
         self._mt_y = None
+        # Which raw evdev signal is authoritative for touch-down/up — set
+        # for real once the actual device's capabilities are known, in
+        # run(). Defaults True (ABS_MT_TRACKING_ID) here only so the
+        # attribute exists before that; see _handle_raw_event's docstring.
+        self._uses_tracking_id: bool = True
         # Content-area gesture lock ("seek" | "volume" | None) — see
         # _GESTURE_DEADZONE and _handle_content_gesture().
         self._gesture: str | None = None
@@ -370,6 +375,40 @@ class TouchDaemon:
         self._axis_y = self._axis_info(dev, ecodes.ABS_MT_POSITION_Y, ecodes.ABS_Y)
         LOG.info("touch axis ranges: x=%s y=%s", self._axis_x, self._axis_y)
 
+        # Duplicate touch-lifecycle fix: most real touchscreen controllers
+        # (very likely including this panel) report a single physical
+        # contact through BOTH the protocol-B multitouch event
+        # (ABS_MT_TRACKING_ID going from -1 to a real id, and back to -1 on
+        # release) AND the legacy protocol-A single-touch mirror (BTN_TOUCH
+        # 1/0) -- the Linux kernel's own multitouch-protocol documentation
+        # explicitly recommends drivers emit both, for backward
+        # compatibility with single-touch-only software. Previously
+        # _handle_raw_event() treated each as an independent trigger for
+        # _on_touch_down()/_on_touch_up(), so ONE physical tap produced TWO
+        # (occasionally more) logical touch-down/up cycles -- confirmed live
+        # via journalctl: every content-area tap logged "touch tap ->
+        # _toggle_overlay" immediately followed by "restoring overlay" (the
+        # second, redundant touch-up landing after the first one had already
+        # hidden the overlay), a single Scan tap logged THREE
+        # "update_database" dispatches back to back, and rapid-fire
+        # Next/Prev taps (each really a duplicated pair) triggered mpv's
+        # documented loadfile-race warning ("did not confirm file load
+        # within 3.0s").
+        #
+        # Fix: pick ONE authoritative lifecycle source, on this axis-info
+        # call, based on the device's actual advertised capabilities --
+        # ABS_MT_TRACKING_ID when the panel reports it (the kernel's own
+        # docs call this the authoritative per-contact signal on protocol-B
+        # devices, with BTN_TOUCH being redundant/optional there), falling
+        # back to BTN_TOUCH only for a genuine single-touch-only device that
+        # never reports a tracking id at all. This is a capability check,
+        # not a timing-based debounce -- no delay is added to real taps.
+        abs_caps = dict(dev.capabilities().get(ecodes.EV_ABS, []))
+        self._uses_tracking_id = ecodes.ABS_MT_TRACKING_ID in abs_caps
+        LOG.info("touch lifecycle source: %s",
+                 "ABS_MT_TRACKING_ID (BTN_TOUCH ignored)" if self._uses_tracking_id
+                 else "BTN_TOUCH (no ABS_MT_TRACKING_ID reported)")
+
         self._ensure_idle_video()
         self._visualizer.start()
 
@@ -387,6 +426,11 @@ class TouchDaemon:
                     time.sleep(2.0)
                     continue
                 dev = new_dev
+                # Re-derive the lifecycle source for whichever device we
+                # just reconnected to -- a hot-swap could land on hardware
+                # with different capabilities than what we started with.
+                abs_caps = dict(dev.capabilities().get(ecodes.EV_ABS, []))
+                self._uses_tracking_id = ecodes.ABS_MT_TRACKING_ID in abs_caps
                 continue
 
             if ready:
@@ -421,22 +465,32 @@ class TouchDaemon:
         Logged at DEBUG per-event (very chatty — only useful with
         --verbose while diagnosing a misbehaving panel) and at INFO for
         the down/up/dispatch transitions that actually matter.
+
+        Only ONE of ABS_MT_TRACKING_ID / BTN_TOUCH is treated as the
+        touch-lifecycle signal (see ``self._uses_tracking_id``, set once in
+        ``run()`` from the device's real capabilities) — a controller that
+        reports both for the same physical contact (the common case; see the
+        kernel's multitouch-protocol docs) would otherwise fire
+        _on_touch_down()/_on_touch_up() twice per tap. BTN_TOUCH's position
+        (x/y) is still read unconditionally below since some single-touch
+        devices only ever populate ABS_X/ABS_Y, never the MT_POSITION pair.
         """
         if event.type == ecodes.EV_ABS:
             if event.code in (ecodes.ABS_MT_POSITION_X, ecodes.ABS_X):
                 self._mt_x = event.value
             elif event.code in (ecodes.ABS_MT_POSITION_Y, ecodes.ABS_Y):
                 self._mt_y = event.value
-            elif event.code == ecodes.ABS_MT_TRACKING_ID:
+            elif event.code == ecodes.ABS_MT_TRACKING_ID and self._uses_tracking_id:
                 if event.value == -1:
                     self._on_touch_up()
                 else:
                     self._on_touch_down()
         elif event.type == ecodes.EV_KEY and event.code == ecodes.BTN_TOUCH:
-            if event.value == 1:
-                self._on_touch_down()
-            else:
-                self._on_touch_up()
+            if not self._uses_tracking_id:
+                if event.value == 1:
+                    self._on_touch_down()
+                else:
+                    self._on_touch_up()
         elif event.type == ecodes.EV_SYN and event.code == ecodes.SYN_REPORT:
             self._on_position_update()
 
