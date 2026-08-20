@@ -47,8 +47,15 @@ _KEY_TEMPO_RE = re.compile(
 
 # N-in-1 prefix variants: "3 IN 1 - ", "3IN1 - ", "2in1 - "
 _N_IN_1_RE = re.compile(
-    r"^\d+\s*IN\s*\d+\s*-\s*",
+    r"^\d+\s*IN\s*\d+(?:\s*[-_]\s*)?",
     re.IGNORECASE | re.ASCII,
+)
+
+# Record pools commonly prepend a short distributor/source marker, e.g.
+# ``(CXT) -``.  It is not part of either the song title or the artist.
+_LEADING_LABEL_RE = re.compile(
+    r"^(?:\([^)]{1,32}\)|\[[^\]]{1,32}\])\s*-\s*",
+    re.ASCII,
 )
 
 # Separator: space - space (the only reliable title/artist divider)
@@ -74,11 +81,17 @@ def parse(filename: str) -> tuple[str, str]:
         ('BANH MI 2026 HD_2', '')
         >>> parse("6A_ Ke$ha - Crazy Kids.wav")
         ('Ke$ha', 'Crazy Kids')
+        >>> parse("(CXT) - SAO MINH CHUA NAM TAY 2025 X VND HD BOYBB.mp3")
+        ('SAO MINH CHUA NAM TAY 2025 X VND HD BOYBB', '')
     """
     stem = Path(filename).stem.strip()
     if not stem:
         return "", ""
 
+    # Make the visually equivalent dash forms emitted by DJ software behave
+    # like a regular hyphen before stripping prefixes.
+    stem = stem.replace("–", "-").replace("—", "-")
+    stem = _LEADING_LABEL_RE.sub("", stem).strip()
     # Strip N-in-1 prefix first (it can precede the key/tempo prefix too)
     stem = _N_IN_1_RE.sub("", stem).strip()
     # Strip key/tempo prefix
@@ -126,6 +139,23 @@ def _is_spam(tag: str) -> bool:
     return False
 
 
+_UNKNOWN_RE = re.compile(r"^\(?\s*(?:unknown|n/?a|none|null)\s*\)?$", re.IGNORECASE)
+
+
+def clean_tag(value: str) -> str:
+    """Return a display-safe ID3 value, or ``""`` when it is unavailable.
+
+    Sending a literal ``Unknown`` is worse than sending an empty value: Toyota
+    displays it as a real tag.  Promotional record-pool strings are treated
+    the same way.  The caller must still *emit* the empty MPRIS field so the
+    head unit clears its old value instead of substituting ``(Unknown)``.
+    """
+    value = (value or "").strip()
+    if not value or _UNKNOWN_RE.fullmatch(value) or _is_spam(value):
+        return ""
+    return value
+
+
 def enrich(title: str, artist: str, filename: str) -> tuple[str, str]:
     """Return ``(title, artist)`` using the ID3 values when non-blank and not
     spam, falling back to filename parsing otherwise.
@@ -139,14 +169,8 @@ def enrich(title: str, artist: str, filename: str) -> tuple[str, str]:
     can be determined: an empty string is what the Camry and Bose headphones
     display as "nothing" rather than "(Unknown)".
     """
-    clean_title = (title or "").strip()
-    clean_artist = (artist or "").strip()
-
-    # Strip spam watermarks — treat them the same as blank
-    if _is_spam(clean_title):
-        clean_title = ""
-    if _is_spam(clean_artist):
-        clean_artist = ""
+    clean_title = clean_tag(title)
+    clean_artist = clean_tag(artist)
 
     if clean_title and clean_artist:
         return clean_title, clean_artist
@@ -157,3 +181,14 @@ def enrich(title: str, artist: str, filename: str) -> tuple[str, str]:
         clean_title or parsed_title,
         clean_artist or parsed_artist,
     )
+
+
+def enrich_metadata(title: str, artist: str, album: str, filename: str) -> tuple[str, str, str]:
+    """Return display-safe ``(title, artist, album)`` for every UI client.
+
+    Album has no reliable filename fallback, so unavailable/spam album tags
+    are deliberately returned as an empty string.  This keeps the shared
+    policy suitable for AVRCP and the touch UI alike.
+    """
+    clean_title, clean_artist = enrich(title, artist, filename)
+    return clean_title, clean_artist, clean_tag(album)

@@ -54,7 +54,7 @@ if _PLAYER_ROOT not in sys.path:
     sys.path.insert(0, _PLAYER_ROOT)
 
 try:
-    from player.id3_fallback import enrich as _id3_enrich
+    from player.id3_fallback import enrich_metadata as _id3_enrich_metadata
     _HAS_ID3_FALLBACK = True
 except ImportError:
     _HAS_ID3_FALLBACK = False
@@ -224,13 +224,16 @@ class _MediaPlayer(dbus.service.Object):
         # BlueZ's RegisterPlayer API consumes MPRIS 2.2 metadata, not its own
         # org.bluez.MediaPlayer1 representation.
         track: dict[str, dbus.types.Any] = {}
+        # Always emit all display fields, including empty Artist/Album.  The
+        # Camry renders an omitted field as "(Unknown)", while an explicit
+        # zero-length value clears the corresponding display line.
+        title = str(song.get("title", "")) if song else ""
+        artist = str(song.get("artist", "")) if song else ""
+        album = str(song.get("album", "")) if song else ""
+        track["xesam:title"] = dbus.String(title)
+        track["xesam:artist"] = dbus.Array([dbus.String(artist)], signature="s")
+        track["xesam:album"] = dbus.String(album)
         if song:
-            if t := song.get("title"):
-                track["xesam:title"] = dbus.String(t)
-            if a := song.get("artist"):
-                track["xesam:artist"] = dbus.Array([dbus.String(a)], signature="s")
-            if al := song.get("album"):
-                track["xesam:album"] = dbus.String(al)
             if n := song.get("track"):
                 try:
                     track["xesam:trackNumber"] = dbus.Int32(int(str(n).split("/")[0]))
@@ -301,9 +304,9 @@ class _MediaPlayer(dbus.service.Object):
                 changed[key]     = val
 
         if changed:
-            title = str(track.get("xesam:title", "?"))
+            log_title = str(track.get("xesam:title", ""))
             LOG.info("→ BlueZ AVRCP push: status=%s track=%r changed=%s",
-                     mpris_state, title, list(changed))
+                     mpris_state, log_title, list(changed))
             self.PropertiesChanged(_MPRIS_PLAYER_IFACE, changed, [])
 
         return False  # GLib idle callback: don't repeat
@@ -498,9 +501,8 @@ def _mpd_cmd(command: str, *args) -> None:
 def _push_current_mpd_state(player: _MediaPlayer, force: bool = False) -> None:
     """Read current MPD state synchronously and push it to BlueZ.
 
-    ID3 fallback: if the song's title or artist tag is blank, derive them from
-    the filename using player.id3_fallback so the Camry head unit shows
-    something useful instead of "(Unknown)".
+    ID3 fallback removes spam and derives title/artist from the filename.
+    Album has no trustworthy filename source, so it is explicitly blanked.
     """
     try:
         c = _mpd.MPDClient()
@@ -509,21 +511,21 @@ def _push_current_mpd_state(player: _MediaPlayer, force: bool = False) -> None:
         song   = c.currentsong()
         c.close()
         c.disconnect()
-        # Enrich missing ID3 tags from filename before pushing to BlueZ.
+        # Normalize all display fields before pushing to BlueZ.  Values are
+        # retained even when empty: update_from_mpd emits those empty fields so
+        # the Camry clears the line instead of showing "(Unknown)".
         if song and _HAS_ID3_FALLBACK:
             filename = song.get("file", "")
             title = song.get("title", "")
             artist = song.get("artist", "")
-            enriched_title, enriched_artist = _id3_enrich(title, artist, filename)
-            if enriched_title != title or enriched_artist != artist:
-                song = dict(song)
-                if enriched_title:
-                    song["title"] = enriched_title
-                if enriched_artist:
-                    song["artist"] = enriched_artist
-                elif "artist" in song:
-                    # Explicitly blank artist is better than "(Unknown)"
-                    song["artist"] = ""
+            album = song.get("album", "")
+            enriched_title, enriched_artist, enriched_album = _id3_enrich_metadata(
+                title, artist, album, filename
+            )
+            song = dict(song)
+            song["title"] = enriched_title
+            song["artist"] = enriched_artist
+            song["album"] = enriched_album
         player.update_from_mpd(status, song, force=force)
     except Exception as exc:
         LOG.warning("MPD state read failed: %s", exc)
