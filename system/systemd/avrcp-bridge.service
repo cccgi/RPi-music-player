@@ -25,7 +25,7 @@ Restart=always
 RestartSec=5
 
 # avrcp-bridge logs to stdout; route both to the journal.
-# Retrieve with: journalctl --user -u avrcp-bridge
+# Retrieve with: journalctl -u avrcp-bridge
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=avrcp-bridge

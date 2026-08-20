@@ -33,6 +33,20 @@ from .video import VideoCommander, VideoError, VideoLibrary, load_and_play
 LOG = logging.getLogger(__name__)
 
 
+def _set_mac_tag(music_root: Path, abs_path: Path, color: str | None) -> None:
+    """Apply (or clear) a macOS Finder color tag on *abs_path*.
+
+    Only effective on internal storage (ext4 xattr support); silently ignored
+    on USB/exFAT.  Imported lazily so a missing mac_tags module never breaks
+    curate actions.
+    """
+    try:
+        from .mac_tags import set_tag
+        set_tag(abs_path, color)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @dataclass
 class DeleteSettings:
     """Mirror of config.DeleteConfig, passed into ActionContext."""
@@ -714,8 +728,17 @@ def _video_curate_current(ctx: ActionContext, magnitude: int) -> str | None:
 
 def _curate_to_folder(ctx: ActionContext, folder_name: str) -> str | None:
     """Shared implementation for curate_to_favorites and any future
-    named-folder curate variants.  Moves the current track into
-    ``<containing_dir>/<folder_name>/`` rather than ``Curated/``."""
+    named-folder curate variants.
+
+    NORMAL (song not already in a folder_name folder):
+      Moves the current track into ``<containing_dir>/<folder_name>/``.
+
+    REVERSE (song IS already inside a folder_name folder — user pressed
+    Curate a second time on a curated song, or is browsing inside Favorites):
+      Moves the song BACK to the parent of that folder_name folder.
+      This prevents the double-press nesting bug (Favorites/Favorites/...)
+      and lets a curated card be "un-curated" by pressing the same button.
+    """
     song = ctx.mpd.current_song()
     uri = song.get("file", "")
     if not uri:
@@ -723,13 +746,53 @@ def _curate_to_folder(ctx: ActionContext, folder_name: str) -> str | None:
 
     music_dir = (getattr(ctx.delete, "music_dir", "") if ctx.delete else "") or "/home/rpi/Music"
     root = Path(music_dir)
-    rel_dir = str(Path(uri).parent)
-    if rel_dir in (".", "/"):
-        rel_dir = ""
-
     src = root / uri
     if not src.is_file():
         return "File missing"
+
+    uri_parts = Path(uri).parts  # e.g. ("FolderA", "Favorites", "Song.mp3")
+
+    # ---- REVERSE: song is already inside a folder_name folder -------------
+    if folder_name in uri_parts:
+        # Find the FIRST occurrence of folder_name in the path.
+        fav_idx = next(i for i, p in enumerate(uri_parts) if p == folder_name)
+        # Target dir = everything ABOVE that folder_name component.
+        parent_parts = uri_parts[:fav_idx]
+        target_dir = root / Path(*parent_parts) if parent_parts else root
+
+        # Update dirs: source folder AND target folder (so MPD sees both sides
+        # of the move).
+        source_rel = str(Path(*uri_parts[:fav_idx + 1])) if fav_idx >= 0 else ""
+        target_rel = str(Path(*parent_parts)) if parent_parts else ""
+
+        for attempt in (1, 2):
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target = _unique_target(target_dir, src.name)
+                shutil.move(str(src), str(target))
+                break
+            except OSError as exc:
+                if exc.errno == 30 and attempt == 1:
+                    if not _try_remount_usb_rw():
+                        LOG.error("un-curate(%s) failed for %s: %s", folder_name, src, exc)
+                        return "Curate failed"
+                    time.sleep(0.3)
+                    continue
+                LOG.error("un-curate(%s) failed for %s: %s", folder_name, src, exc)
+                return "Curate failed"
+
+        ctx.mpd._call("update", source_rel)
+        if target_rel:
+            ctx.mpd._call("update", target_rel)
+        LOG.info("un-curated from %s: %s -> %s", folder_name, src, target)
+        # Clear the green mac tag from the file at its new location.
+        _set_mac_tag(root, target, None)
+        return f"← {folder_name}"
+
+    # ---- NORMAL: move into folder_name subfolder --------------------------
+    rel_dir = str(Path(uri).parent)
+    if rel_dir in (".", "/"):
+        rel_dir = ""
 
     dest_dir = (root / rel_dir / folder_name) if rel_dir else (root / folder_name)
     for attempt in (1, 2):
@@ -751,6 +814,8 @@ def _curate_to_folder(ctx: ActionContext, folder_name: str) -> str | None:
     update_dir = f"{rel_dir}/{folder_name}" if rel_dir else folder_name
     ctx.mpd._call("update", update_dir)
     LOG.info("curated to %s: %s -> %s", folder_name, src, target)
+    # Apply green mac tag to the file at its new location.
+    _set_mac_tag(root, target, "green")
     return f"→ {folder_name}"
 
 
@@ -1032,6 +1097,134 @@ def _video_set_storage_internal(ctx: ActionContext, magnitude: int) -> str | Non
 @action("video_set_storage_usb")
 def _video_set_storage_usb(ctx: ActionContext, magnitude: int) -> str | None:
     return _apply_video_storage_set(ctx, "usb")
+
+
+# ---------------------------------------------------------------------------
+# Bluetooth utilities — AVRCP enforce and HFP capture
+# ---------------------------------------------------------------------------
+
+# The Camry is the AVRCP Controller (steering-wheel commands) and the Pi is
+# its Target.  Device1.ConnectProfile needs the *remote service* UUID, so this
+# is AVRCP Controller (0x110e), not the Pi's Target UUID (0x110c).
+_AVRCP_CONTROLLER_UUID = "0000110e-0000-1000-8000-00805f9b34fb"
+
+# Where hfp-monitor writes its capture file.  Accessible over Samba when
+# back in WiFi range.
+_HFP_CAPTURE_FILE = "/home/rpi/hfp-capture.txt"
+_HFP_PIDFILE = "/run/rpi-player/hfp-monitor.pid"
+
+
+@action("enforce_avrcp")
+def _enforce_avrcp(ctx: ActionContext, magnitude: int) -> str | None:
+    """Force AVRCP profile connection on every currently connected BT device.
+
+    Only devices advertising AVRCP Controller are eligible.  In particular,
+    never issue an AVRCP request to arbitrary connected headphones/phones.
+    """
+    import subprocess as _sp
+
+    # Get connected device MACs from bluetoothctl
+    out = _sp.run(["bluetoothctl", "devices", "Connected"],
+                  capture_output=True, text=True, timeout=5).stdout
+    macs = [line.split()[1] for line in out.splitlines() if "Device" in line]
+
+    if not macs:
+        # Fall back: list all known devices and check Connected flag
+        all_out = _sp.run(["bluetoothctl", "devices"],
+                          capture_output=True, text=True, timeout=5).stdout
+        all_macs = [line.split()[1] for line in all_out.splitlines() if "Device" in line]
+        for mac in all_macs:
+            info = _sp.run(["bluetoothctl", "info", mac],
+                           capture_output=True, text=True, timeout=5).stdout
+            if "Connected: yes" in info:
+                macs.append(mac)
+
+    if not macs:
+        return "No BT device"
+
+    ok = 0
+    attempted = 0
+    for mac in macs:
+        try:
+            info = _sp.run(["bluetoothctl", "info", mac], capture_output=True,
+                           text=True, timeout=5).stdout
+            if _AVRCP_CONTROLLER_UUID not in info.lower():
+                LOG.info("enforce_avrcp: %s does not advertise AVRCP Controller", mac)
+                continue
+            # bluetoothctl's documented form maps to Device1.ConnectProfile.
+            r = _sp.run(["bluetoothctl", "connect", mac, _AVRCP_CONTROLLER_UUID],
+                        capture_output=True, text=True, timeout=8)
+        except (OSError, _sp.TimeoutExpired) as exc:
+            LOG.warning("enforce_avrcp: %s failed to invoke bluetoothctl: %s", mac, exc)
+            continue
+        attempted += 1
+        if r.returncode == 0 or "success" in r.stdout.lower():
+            ok += 1
+        LOG.info("enforce_avrcp: %s → rc=%d %s", mac, r.returncode, r.stdout.strip()[:60])
+
+    return f"AVRCP {ok}/{attempted}" if attempted else "No AVRCP CT"
+
+
+@action("start_hfp_monitor")
+def _start_hfp_monitor(ctx: ActionContext, magnitude: int) -> str | None:
+    """Start hfp-monitor in the background, writing to the capture file.
+
+    The capture file is accessible over Samba as [Music]/hfp-capture.txt
+    (once back in WiFi range).  A PID file prevents double-starting.
+    """
+    import subprocess as _sp
+
+    pid_path = Path(_HFP_PIDFILE)
+    if pid_path.exists():
+        try:
+            pid = int(pid_path.read_text().strip())
+            # Check if it's still running
+            import os as _os
+            _os.kill(pid, 0)
+            return "HFP: already on"
+        except (OSError, ValueError):
+            pid_path.unlink(missing_ok=True)
+
+    try:
+        proc = _sp.Popen(
+            ["sudo", "python3", "/opt/rpi-player/bin/hfp-monitor",
+             "--save", _HFP_CAPTURE_FILE],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            start_new_session=True,
+        )
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path.write_text(str(proc.pid))
+        LOG.info("hfp-monitor started: pid=%d → %s", proc.pid, _HFP_CAPTURE_FILE)
+        return "HFP: recording"
+    except Exception as exc:
+        LOG.error("start_hfp_monitor failed: %s", exc)
+        return "HFP: failed"
+
+
+@action("stop_hfp_monitor")
+def _stop_hfp_monitor(ctx: ActionContext, magnitude: int) -> str | None:
+    """Stop the hfp-monitor process started by start_hfp_monitor."""
+    import os as _os
+    import signal as _signal
+
+    pid_path = Path(_HFP_PIDFILE)
+    if not pid_path.exists():
+        return "HFP: not running"
+
+    try:
+        pid = int(pid_path.read_text().strip())
+        # Kill the whole process group so sudo + python3 child both die
+        try:
+            _os.killpg(_os.getpgid(pid), _signal.SIGTERM)
+        except OSError:
+            _os.kill(pid, _signal.SIGTERM)
+        pid_path.unlink(missing_ok=True)
+        LOG.info("hfp-monitor stopped (pid=%d)", pid)
+        return "HFP: stopped"
+    except (OSError, ValueError) as exc:
+        pid_path.unlink(missing_ok=True)
+        LOG.warning("stop_hfp_monitor: %s", exc)
+        return "HFP: stopped"
 
 
 # ---------------------------------------------------------------------------

@@ -206,6 +206,27 @@ class LibraryBrowser:
             self.refresh()
             return "Library"
 
+    def jump_to_playing(self, uri: str) -> bool:
+        """Navigate to the folder containing *uri* and scroll so that file
+        is visible in the current page window.
+
+        Returns True if the entry was found, False if the URI is not in the
+        library listing (e.g. the database hasn't updated yet after a move).
+        """
+        with self._lock:
+            folder = os.path.dirname(uri)
+            if self.path != folder:
+                self.path = folder
+                self.offset = 0
+                self.refresh()
+            # Scroll to the page that contains the playing entry.
+            for i, entry in enumerate(self.entries):
+                if entry.uri == uri:
+                    self.offset = (i // VISIBLE_SLOTS) * VISIBLE_SLOTS
+                    return True
+            # Entry not found (URI changed since refresh) — stay in folder.
+            return False
+
     # -- presentation helpers ---------------------------------------------
 
     def breadcrumb(self) -> str:

@@ -58,7 +58,7 @@ LAYOUT: dict[int, KeyDef] = {
     index(0, 2): KeyDef("browse_entry", params={"slot": 2}),
     index(0, 3): KeyDef("browse_entry", params={"slot": 3}),
     # One authoritative now-playing key, then distinct metadata beside it.
-    index(0, 4): KeyDef("now_playing_title", action="toggle_pause"),
+    index(0, 4): KeyDef("now_playing_title", action="jump_to_playing"),
     # Was a plain (inert) album-name display — no album art, so there was
     # nothing to press and nothing useful to show. Repurposed: jump the
     # browser straight to the library root in one press, so a folder several
@@ -108,7 +108,10 @@ LAYOUT: dict[int, KeyDef] = {
     # (loop the current queue/folder) -> Song (repeat just the current
     # track) -> Off.
     index(1, 6): KeyDef("mode_repeat3", action="cycle_repeat_mode"),
-    index(1, 7): KeyDef("mode_consume", action="toggle_consume"),
+    # Was toggle_consume — rarely used and unreadable at glance. Replaced with
+    # a dedicated current-folder-name display so the user always knows which
+    # folder they're browsing without squinting at the Up button's tiny label.
+    index(1, 7): KeyDef("current_folder"),
 
     # -----------------------------------------------------------------------
     # Row 2 — transport
@@ -584,12 +587,22 @@ LAYOUT_BT_PICKER: dict[int, KeyDef] = {
     index(0, 4): KeyDef("bt_entry", params={"slot": 4}),
     index(0, 5): KeyDef("bt_entry", params={"slot": 5}),
 
+    # Row 2: HFP keypad capture + AVRCP enforce
+    # HFP monitor writes AT commands from the Camry's phone keypad to a file
+    # so you can identify what * and # send without needing SSH on the road.
+    index(2, 4): KeyDef("glyph", action="start_hfp_monitor",
+                        params={"symbol": "record", "colour": "#FF3B30"}, label="Rec HFP"),
+    index(2, 5): KeyDef("glyph", action="stop_hfp_monitor",
+                        params={"symbol": "stop"}, label="Stop HFP"),
+    # Force AVRCP re-negotiation on all connected BT devices — recovers a
+    # dropped AVRCP session (metadata / steering wheel controls) without a
+    # full disconnect/reconnect cycle.
+    index(2, 6): KeyDef("glyph", action="enforce_avrcp",
+                        params={"symbol": "bluetooth", "caption": "AVRCP"}, label="Fix AVRCP"),
+
     # Clears any paired-but-disconnected device's stuck bond (bt.py's
     # reset_failed_pairings_async) so a device stuck failing to reconnect
-    # can be re-paired from scratch without needing SSH on the road -- see
-    # the "Bose SLIII shows up but still can't pair/connect" incident this
-    # was added for: `bluetoothctl remove` alone sometimes leaves a stale
-    # on-disk record that makes a fresh `pair` fail with `AlreadyExists`.
+    # can be re-paired from scratch without needing SSH on the road.
     index(3, 6): KeyDef("bt_reset", action="reset_bt_pairings", label="Reset"),
 
     index(3, 7): KeyDef("video_back", action="close_bt_picker", label="Back"),

@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Flatten deeply-nested Favorites folders to a single level.
+
+After the double-press curate bug, songs that were already in a Favorites
+folder got moved into Favorites/Favorites/, then Favorites/Favorites/Favorites/,
+etc.  This one-time recovery script finds every file that is more than one
+Favorites level deep and moves it up to the nearest single-level Favorites
+folder.
+
+Before:
+    FolderA/Favorites/Favorites/Favorites/Song.mp3
+
+After:
+    FolderA/Favorites/Song.mp3
+
+Usage:
+    python3 /opt/rpi-player/bin/flatten-favorites [--dry-run] [ROOT_DIR ...]
+
+    ROOT_DIR defaults to /mnt/usb-storage/Audio and /home/rpi/Music-internal.
+    --dry-run  shows what would be moved without actually doing it.
+
+After running, trigger an MPD database update:
+    mpc update
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import sys
+from pathlib import Path
+
+_DEFAULT_ROOTS = [
+    "/mnt/usb-storage/Audio",
+    "/home/rpi/Music-internal",
+]
+
+_FAVORITES = "Favorites"
+
+
+def _unique_target(dest_dir: Path, name: str) -> Path:
+    """Return dest_dir/name, or a numeric-suffixed variant to avoid collisions."""
+    target = dest_dir / name
+    if not target.exists():
+        return target
+    stem, suffix = target.stem, target.suffix
+    n = 1
+    while True:
+        candidate = dest_dir / f"{stem} ({n}){suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def _first_favorites_ancestor(path: Path) -> Path | None:
+    """Return the OUTERMOST Favorites directory in path's ancestors, or None.
+
+    For /a/b/Favorites/Favorites/Favorites/song.mp3 this returns
+    /a/b/Favorites so we can move the song there.
+    """
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if part == _FAVORITES:
+            # Reconstruct the path up to and including this Favorites component.
+            return Path(*parts[:i + 1])
+    return None
+
+
+def flatten(root: Path, dry_run: bool) -> tuple[int, int]:
+    """Walk root, find double-nested Favorites, flatten them.
+
+    Returns (files_moved, errors).
+    """
+    moved = 0
+    errors = 0
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        current_dir = Path(dirpath)
+        parts = current_dir.relative_to(root).parts
+
+        # Count how many Favorites components appear in the current path.
+        fav_count = sum(1 for p in parts if p == _FAVORITES)
+        if fav_count < 2:
+            # This directory is at most one level inside a Favorites —
+            # its files are correctly placed; skip.
+            continue
+
+        # This directory is at least two levels inside nested Favorites.
+        # Find the outermost Favorites and use ITS parent as the target dir.
+        # e.g. root/FolderA/Favorites/Favorites/Favorites → target = root/FolderA/Favorites
+        target_dir = root
+        for i, p in enumerate(parts):
+            if p == _FAVORITES:
+                target_dir = root / Path(*parts[:i + 1])
+                break
+
+        for fname in filenames:
+            src = current_dir / fname
+            target = _unique_target(target_dir, fname)
+            if dry_run:
+                print(f"[DRY-RUN] {src}  →  {target}")
+            else:
+                try:
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src), str(target))
+                    print(f"Moved: {src}  →  {target}")
+                    moved += 1
+                except OSError as exc:
+                    print(f"ERROR: {src}: {exc}", file=sys.stderr)
+                    errors += 1
+
+    if not dry_run:
+        # Remove empty nested Favorites directories (deepest first).
+        for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+            current_dir = Path(dirpath)
+            parts = current_dir.relative_to(root).parts
+            fav_count = sum(1 for p in parts if p == _FAVORITES)
+            if fav_count < 2:
+                continue
+            if not any(current_dir.iterdir()):
+                try:
+                    current_dir.rmdir()
+                    print(f"Removed empty dir: {current_dir}")
+                except OSError:
+                    pass
+
+    return moved, errors
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("roots", nargs="*", default=_DEFAULT_ROOTS,
+                        help="Root directories to process (default: USB Audio + internal Music)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would be moved without doing it")
+    args = parser.parse_args()
+
+    total_moved = 0
+    total_errors = 0
+
+    for root_str in args.roots:
+        root = Path(root_str)
+        if not root.is_dir():
+            print(f"Skipping {root}: not a directory", file=sys.stderr)
+            continue
+
+        print(f"\n{'[DRY-RUN] ' if args.dry_run else ''}Processing: {root}")
+        moved, errors = flatten(root, dry_run=args.dry_run)
+        total_moved += moved
+        total_errors += errors
+
+    if args.dry_run:
+        print("\n(dry-run complete — nothing was moved)")
+    else:
+        print(f"\nDone: {total_moved} file(s) moved, {total_errors} error(s)")
+        if total_moved:
+            print("Run 'mpc update' or use the Stream Deck Scan button to refresh MPD.")
+
+
+if __name__ == "__main__":
+    main()

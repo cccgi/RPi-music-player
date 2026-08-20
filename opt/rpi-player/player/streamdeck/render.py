@@ -226,6 +226,30 @@ class KeyRenderer:
                       fill=sub_colour or self.theme.muted, anchor="mm")
         return image
 
+    def current_folder(self, name: str) -> Image.Image:
+        """Display the current browser folder name in large bold text.
+
+        Replaces the Consume toggle button so the user can read which folder
+        they're in without squinting at the Up button's truncated sub-label.
+        Shows "Library" at the root level.
+        """
+        image, draw = self._blank()
+        # Small muted header line
+        draw.text((48, 18), "Folder", font=_font(self.theme.font_regular, 11),
+                  fill=self.theme.muted, anchor="mm")
+        # Large bold folder name — auto-sizes down to fit, wraps if needed
+        fitted, font = _fit_text(draw, name, self.theme.font_bold, 88, 22, min_size=13)
+        if fitted.endswith("…"):
+            wrap_font = _font(self.theme.font_bold, 15)
+            lines = _wrap(draw, name, wrap_font, 88, 3)
+            y = 52 - (len(lines) - 1) * 10
+            for line in lines:
+                draw.text((48, y), line, font=wrap_font, fill=self.theme.fg, anchor="mm")
+                y += 20
+        else:
+            draw.text((48, 52), fitted, font=font, fill=self.theme.fg, anchor="mm")
+        return image
+
     def glyph(
         self,
         symbol: str,
@@ -415,43 +439,50 @@ class KeyRenderer:
         is_video: bool = False,
         is_playing: bool = False,
         empty: bool = False,
+        shade: str | None = None,
     ) -> Image.Image:
         """One row of the library browser, or one of the video page's
         "up next" / subfolder-shortcut tiles (both reuse this method).
 
-        Folders get a folder glyph, video files get a screen+play glyph,
-        everything else (music tracks) gets a note glyph — ``is_video`` was
-        added specifically because before it, every non-folder entry got
-        the same note glyph regardless of the actual page, so the video
-        page's own file listing looked identical to the music library's and
-        gave no visual cue you were even looking at video files. The
-        currently playing entry is tinted green so you can see where you
-        are in a listing without cross-referencing the now-playing key.
+        Card background shading (``shade`` parameter):
+          ``"blue"``   — currently playing (was green; changed so curated
+                         cards can use a distinct colour)
+          ``"green"``  — song lives inside a Favorites folder (curated)
+          ``"purple"`` — last-played checkpoint for this folder (resume marker)
+          ``"yellow"`` — listened ≥ 30 s this session (heard, not yet curated)
+          ``None``     — default (no tint)
 
-        A folder's glyph is colour-coded by name (see _folder_color) rather
-        than the flat grey every folder used to render in — makes adjacent
-        folders in a listing (or the video page's subfolder-shortcut tiles)
-        distinguishable at a glance instead of needing to read every label.
-        Only the icon is tinted; the text stays at the normal legible fg
-        colour, and a currently-playing entry still renders fully green
-        exactly as before, since "this is what's playing" is a more
-        important signal than which folder it's in.
-
-        Layout: the icon fills the top 60% of the key (_ICON_TOP..
-        _ICON_BOTTOM below) — previously it was a small ~20px-tall glyph
-        squeezed into the top corner, cramped and hard to read at a
-        glance. The name gets the bottom 40%, capped at 2 lines (a 3rd line
-        never actually helped: at this key size a genuinely long name is
-        already truncated with an ellipsis by then, so the icon giving up
-        vertical space for a line that's just "…" was a bad trade).
+        ``is_playing=True`` always forces ``shade="blue"`` regardless of what
+        the caller passes, so callers can pass shade without needing to clear
+        it when the song starts playing.
         """
         image, draw = self._blank()
         if empty:
             return image
 
-        if is_playing:
-            self._rounded_bg(draw, "#14361F")   # subtle green wash
+        # is_playing wins over any passed shade
+        effective_shade = "blue" if is_playing else shade
+
+        _SHADE_BG = {
+            "blue":   "#0D2540",   # dark blue — currently playing
+            "green":  "#14361F",   # dark green — curated / in Favorites
+            "purple": "#2D1B4E",   # dark purple — checkpoint
+            "yellow": "#38310A",   # dark amber — listened ≥ 30 s
+        }
+        if effective_shade in _SHADE_BG:
+            self._rounded_bg(draw, _SHADE_BG[effective_shade])
+
+        if effective_shade == "blue":
             fg = self.theme.active
+            icon_fg = fg
+        elif effective_shade == "green":
+            fg = "#69DB7C"         # bright green text on dark green bg
+            icon_fg = fg
+        elif effective_shade == "purple":
+            fg = "#B197FC"         # soft purple text
+            icon_fg = fg
+        elif effective_shade == "yellow":
+            fg = "#FFD43B"         # amber text on dark amber bg
             icon_fg = fg
         elif is_dir:
             fg = self.theme.fg
@@ -724,6 +755,11 @@ def _draw_symbol(draw: ImageDraw.ImageDraw, symbol: str, cy: int, fill: str) -> 
         # Ribs, punched out in the background colour
         for dx in (-5, 0, 5):
             draw.line([(cx + dx, cy - 4), (cx + dx, cy + 14)], fill="#101014", width=2)
+
+    elif symbol == "record":
+        # Filled circle — universal "recording active / start recording" symbol.
+        # Drawn in red at the call site to match convention.
+        draw.ellipse([cx - 18, cy - 18, cx + 18, cy + 18], fill=fill)
 
     elif symbol == "power":
         draw.arc([cx - 17, cy - 17, cx + 17, cy + 17], start=300, end=240,

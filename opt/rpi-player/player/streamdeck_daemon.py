@@ -273,6 +273,20 @@ class StreamDeckDaemon:
         self._music_grid_browser: MusicGridBrowser | None = None
         self._video_grid_browser: VideoGridBrowser | None = None
 
+        # Listen-time and folder-checkpoint tracker. Drives the card shading:
+        # blue=playing, green=curated, purple=checkpoint, yellow=listened≥30s.
+        from .listen_state import ListenState
+        self._listen_state = ListenState()
+        self._listen_save_due = time.monotonic() + 60.0  # save every 60 s
+        # Load sticker values from MPD into listen_state (best-of-two merge).
+        # Done after ListenState.__init__ so the JSON is already loaded first.
+        try:
+            self._listen_state.load_stickers(self._mpd)
+        except Exception:  # noqa: BLE001
+            pass
+        # Track last-known current_file so we detect song changes for checkpoint.
+        self._last_current_file = ""
+
         self._bus: BusClient | None = None
         if config.ipc.enabled:
             self._bus = BusClient(config.ipc.socket, self._on_bus_event)
@@ -409,7 +423,8 @@ class StreamDeckDaemon:
     def _invalidate_browser_keys(self) -> None:
         """Force the browser keys to repaint after a navigation."""
         for key, defn in layout.LAYOUT.items():
-            if defn.kind in ("browse_entry", "browse_back", "browse_page", "browse_root"):
+            if defn.kind in ("browse_entry", "browse_back", "browse_page", "browse_root",
+                             "current_folder"):
                 self._rendered.pop(key, None)
 
     def _ensure_music_grid_browser(self) -> MusicGridBrowser | None:
@@ -674,6 +689,35 @@ class StreamDeckDaemon:
 
         self._apply_dimming(playing=state["state"] == "play")
         self._apply_low_power(playing=state["state"] == "play")
+
+        # Listen-state tracking: accumulate listen time and update checkpoint.
+        is_playing = state["state"] == "play"
+        current_file = state.get("current_file", "")
+        self._listen_state.tick(current_file or None, is_playing)
+        if current_file and current_file != self._last_current_file:
+            # Song changed — update checkpoint for the new song's folder.
+            from pathlib import Path as _Path
+            folder = str(_Path(current_file).parent)
+            if folder in (".", "/"):
+                folder = ""
+            self._listen_state.set_checkpoint(folder, current_file)
+            self._last_current_file = current_file
+        # Periodically persist listen state to JSON + MPD stickers + mac tags.
+        now = time.monotonic()
+        if now >= self._listen_save_due:
+            self._listen_state.save()
+            try:
+                self._listen_state.save_stickers(self._mpd)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from pathlib import Path as _TagPath
+                _music_root = _TagPath("/home/rpi/Music-internal")
+                self._listen_state.sync_mac_tags(_music_root)
+            except Exception:  # noqa: BLE001
+                pass
+            self._listen_save_due = now + 60.0
+
         self._render_all(state)
 
         # Wake on: an MPD idle event, a bus message, or the tick interval when
@@ -1229,10 +1273,16 @@ class StreamDeckDaemon:
             current_ref = (state.get("current_video_path", "") if is_video
                            else state.get("current_file", ""))
             playing = bool(current_ref) and entry.ref == current_ref
+            if is_video:
+                shd = None
+            else:
+                shd = self._listen_state.card_shade(
+                    entry.ref, playing, browser.path, entry.is_dir)
             self._push(
-                key, f"grid:{entry.ref}:{playing}",
+                key, f"grid:{entry.ref}:{shd}",
                 lambda: self._renderer.browse_entry(
-                    entry.name, is_dir=entry.is_dir, is_video=is_video, is_playing=playing),
+                    entry.name, is_dir=entry.is_dir, is_video=is_video,
+                    is_playing=playing, shade=shd),
             )
             return
 
@@ -1794,11 +1844,15 @@ class StreamDeckDaemon:
                                                                empty=True))
             else:
                 playing = entry.uri == state["current_file"]
+                folder = browser.path if browser else ""
+                shd = self._listen_state.card_shade(
+                    entry.uri, playing, folder, entry.is_dir)
                 self._push(
                     key,
-                    f"browse:{entry.uri}:{playing}",
+                    f"browse:{entry.uri}:{shd}",
                     lambda: self._renderer.browse_entry(
-                        entry.name, is_dir=entry.is_dir, is_playing=playing
+                        entry.name, is_dir=entry.is_dir, is_playing=playing,
+                        shade=shd,
                     ),
                 )
 
@@ -1831,6 +1885,15 @@ class StreamDeckDaemon:
                     key, f"browse-page:{sub}",
                     lambda: self._renderer.browse_nav("More", sub=sub, enabled=multi, icon="cycle"),
                 )
+
+        elif kind == "current_folder":
+            browser = self._ensure_browser()
+            folder = (os.path.basename(browser.path) if browser and browser.path
+                      else "Library")
+            self._push(
+                key, f"folder:{folder}",
+                lambda: self._renderer.current_folder(folder),
+            )
 
         else:
             self._push(key, "blank", self._renderer.blank)
@@ -2448,6 +2511,17 @@ class StreamDeckDaemon:
                 self._toast_text = toast[:16]
                 self._toast_until = time.monotonic() + TOAST_SECONDS
             self._redraw_event.set()
+            return
+
+        if definition.action == "jump_to_playing":
+            # Navigate the browser to the folder of the currently playing song
+            # and scroll so the song is visible. Does not start/stop playback.
+            browser = self._ensure_browser()
+            current_file = self._last_current_file or None
+            if browser is not None and current_file:
+                browser.jump_to_playing(current_file)
+                self._invalidate_browser_keys()
+                self._redraw_event.set()
             return
 
         if definition.action == "enter_page2":

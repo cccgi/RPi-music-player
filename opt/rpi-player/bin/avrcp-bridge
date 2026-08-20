@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """AVRCP ↔ MPD bridge — hardened edition.
 
-Registers a BlueZ MediaPlayer1 object so that connected Bluetooth devices
+Registers an MPRIS media-player object with BlueZ so that connected Bluetooth devices
 acting as AVRCP Controllers (Bose QC45 headphone buttons, Toyota Camry
 steering wheel) can control MPD playback.  Also pushes current track
 metadata back to BlueZ so devices that support AVRCP metadata can display
@@ -26,7 +26,7 @@ Signal flow:
       │ AVRCP PASSTHROUGH
       ▼
     BlueZ  (routes to our registered /org/rpi_player/mpd object)
-      │ org.bluez.MediaPlayer1 method calls
+      │ org.mpris.MediaPlayer2.Player method calls
       ▼
   this daemon  ──► MPD  (python-mpd2)
 
@@ -42,9 +42,22 @@ python-mpd2.  Not compatible with the player venv (dbus-python not in venv).
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 import time
+
+# Allow importing from the player package even when invoked as a plain script.
+# The package lives at /opt/rpi-player/player/; sys.path needs /opt/rpi-player.
+_PLAYER_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PLAYER_ROOT not in sys.path:
+    sys.path.insert(0, _PLAYER_ROOT)
+
+try:
+    from player.id3_fallback import enrich as _id3_enrich
+    _HAS_ID3_FALLBACK = True
+except ImportError:
+    _HAS_ID3_FALLBACK = False
 
 import dbus
 import dbus.service
@@ -66,8 +79,7 @@ LOG = logging.getLogger("avrcp-bridge")
 # ---- constants --------------------------------------------------------------
 _BLUEZ_SVC          = "org.bluez"
 _BLUEZ_MEDIA_IFACE  = "org.bluez.Media1"
-_BLUEZ_PLAYER_IFACE = "org.bluez.MediaPlayer1"
-_DBUS_OBJMGR_IFACE  = "org.freedesktop.DBus.ObjectManager"
+_MPRIS_PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
 _DBUS_PROPS_IFACE   = "org.freedesktop.DBus.Properties"
 
 _ADAPTER_PATH  = "/org/bluez/hci0"
@@ -75,9 +87,20 @@ _PLAYER_PATH   = "/org/rpi_player/mpd"
 _MPD_HOST      = "localhost"
 _MPD_PORT      = 6600
 
+# When a device connects A2DP (from the device side, not initiated by us),
+# BlueZ refuses the device's inbound AVCTP (AVRCP control channel) attempt
+# with "Refusing unexpected connect" — it only accepts AVCTP sessions it
+# initiates itself. The fix: call ConnectProfile after A2DP connects so
+# BlueZ initiates AVCTP from our side.
+_AVRCP_CONTROLLER_UUID    = "0000110e-0000-1000-8000-00805f9b34fb"
+
+# Retry schedule (ms) for ConnectProfile after a device connects.
+# Multiple attempts handle the race where A2DP hasn't fully settled yet.
+_AVRCP_CONNECT_DELAYS_MS  = [2000, 5000, 12000]  # 2 s, 5 s, 12 s after connect
+
 # Delay between a device connecting and our first metadata push.
 # AVRCP needs a moment to fully negotiate before it will accept our metadata.
-_RECONNECT_PUSH_DELAY_MS = 2000
+_RECONNECT_PUSH_DELAY_MS = 4000
 
 # Heartbeat: re-push all metadata unconditionally this often (ms).
 _HEARTBEAT_INTERVAL_MS = 30_000
@@ -94,55 +117,60 @@ class _MediaPlayer(dbus.service.Object):
         # Shadow of what we last pushed to BlueZ. Used to diff-push.
         # Position is excluded from diff: we only push it with track changes.
         self._props: dict = {
-            "Name":     dbus.String("MPD"),
-            "Type":     dbus.String("Audio"),
-            "Status":   dbus.String("stopped"),
-            "Position": dbus.UInt32(0),
-            "Track":    dbus.Dictionary({}, signature="sv"),
-            "Shuffle":  dbus.String("off"),
-            "Repeat":   dbus.String("off"),
+            "PlaybackStatus": dbus.String("Stopped"),
+            "Position": dbus.Int64(0),
+            "Metadata": dbus.Dictionary({}, signature="sv"),
+            "Shuffle": dbus.Boolean(False),
+            "LoopStatus": dbus.String("None"),
+            "CanPlay": dbus.Boolean(True),
+            "CanPause": dbus.Boolean(True),
+            "CanGoNext": dbus.Boolean(True),
+            "CanGoPrevious": dbus.Boolean(True),
+            "CanControl": dbus.Boolean(True),
+            "Identity": dbus.String("MPD"),
         }
         # Separate tracking for whether the track changed (triggers Position push)
         self._last_song_id: str = ""
+        # Seek detection: track elapsed and wall-clock time at last Position push
+        self._last_push_elapsed: float = 0.0
+        self._last_push_time: float = 0.0  # time.monotonic()
 
     # -------------------------------------------------------------------------
     # AVRCP control commands → MPD
     # -------------------------------------------------------------------------
 
-    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
+    @dbus.service.method(_MPRIS_PLAYER_IFACE)
     def Play(self) -> None:
         LOG.info("AVRCP → Play")
         _mpd_cmd("play")
 
-    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
+    @dbus.service.method(_MPRIS_PLAYER_IFACE)
     def Pause(self) -> None:
         LOG.info("AVRCP → Pause")
         _mpd_cmd("pause", 1)
 
-    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
+    @dbus.service.method(_MPRIS_PLAYER_IFACE)
     def Stop(self) -> None:
         LOG.info("AVRCP → Stop")
         _mpd_cmd("stop")
 
-    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
+    @dbus.service.method(_MPRIS_PLAYER_IFACE)
     def Next(self) -> None:
         LOG.info("AVRCP → Next")
         _mpd_cmd("next")
 
-    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
+    @dbus.service.method(_MPRIS_PLAYER_IFACE)
     def Previous(self) -> None:
         LOG.info("AVRCP → Previous")
         _mpd_cmd("previous")
 
-    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
-    def FastForward(self) -> None:
-        LOG.info("AVRCP → FastForward (+15s)")
-        _mpd_cmd("seekcur", "+15")
-
-    @dbus.service.method(_BLUEZ_PLAYER_IFACE)
-    def Rewind(self) -> None:
-        LOG.info("AVRCP → Rewind (-15s)")
-        _mpd_cmd("seekcur", "-15")
+    @dbus.service.method(_MPRIS_PLAYER_IFACE, in_signature="x")
+    def Seek(self, offset_us: int) -> None:
+        """MPRIS relative seek; AVRCP fast-forward/rewind maps here."""
+        seconds = int(offset_us / 1_000_000)
+        if seconds:
+            LOG.info("AVRCP → Seek (%+ds)", seconds)
+            _mpd_cmd("seekcur", f"{seconds:+d}")
 
     # -------------------------------------------------------------------------
     # D-Bus Properties interface
@@ -154,15 +182,25 @@ class _MediaPlayer(dbus.service.Object):
 
     @dbus.service.method(_DBUS_PROPS_IFACE, in_signature="s", out_signature="a{sv}")
     def GetAll(self, iface: str) -> dict:
-        return self._props if iface == _BLUEZ_PLAYER_IFACE else {}
+        return self._props if iface == _MPRIS_PLAYER_IFACE else {}
 
     @dbus.service.method(_DBUS_PROPS_IFACE, in_signature="ssa{sv}")
     def Set(self, iface: str, name: str, value) -> None:
-        pass  # read-only from BlueZ's perspective
+        # BlueZ can set these two MPRIS settings from a remote controller.
+        if iface == _MPRIS_PLAYER_IFACE and name == "Shuffle":
+            _mpd_cmd("random", 1 if bool(value) else 0)
+        elif iface == _MPRIS_PLAYER_IFACE and name == "LoopStatus":
+            loop = str(value)
+            _mpd_cmd("repeat", 0 if loop == "None" else 1)
+            _mpd_cmd("single", 1 if loop == "Track" else 0)
 
     @dbus.service.signal(_DBUS_PROPS_IFACE, signature="sa{sv}as")
     def PropertiesChanged(self, iface: str, changed: dict, invalidated: list) -> None:
         pass
+
+    def registration_props(self) -> dict:
+        """Initial MPRIS snapshot required by BlueZ's RegisterPlayer call."""
+        return dict(self._props)
 
     # -------------------------------------------------------------------------
     # MPD state → BlueZ player properties
@@ -178,36 +216,38 @@ class _MediaPlayer(dbus.service.Object):
 
         Returns False (for GLib.idle_add / GLib.timeout_add — don't repeat).
         """
-        mpd_state   = status.get("state", "stop")
-        bluez_state = {"play": "playing", "pause": "paused", "stop": "stopped"}.get(
-            mpd_state, "stopped"
+        mpd_state = status.get("state", "stop")
+        mpris_state = {"play": "Playing", "pause": "Paused", "stop": "Stopped"}.get(
+            mpd_state, "Stopped"
         )
 
-        # Build Track dict from MPD song info
+        # BlueZ's RegisterPlayer API consumes MPRIS 2.2 metadata, not its own
+        # org.bluez.MediaPlayer1 representation.
         track: dict[str, dbus.types.Any] = {}
         if song:
             if t := song.get("title"):
-                track["Title"]  = dbus.String(t)
+                track["xesam:title"] = dbus.String(t)
             if a := song.get("artist"):
-                track["Artist"] = dbus.String(a)
+                track["xesam:artist"] = dbus.Array([dbus.String(a)], signature="s")
             if al := song.get("album"):
-                track["Album"]  = dbus.String(al)
+                track["xesam:album"] = dbus.String(al)
             if n := song.get("track"):
                 try:
-                    track["TrackNumber"] = dbus.UInt32(int(str(n).split("/")[0]))
+                    track["xesam:trackNumber"] = dbus.Int32(int(str(n).split("/")[0]))
                 except (ValueError, TypeError):
                     pass
             if d := song.get("duration"):
                 try:
-                    track["Duration"] = dbus.UInt32(int(float(d) * 1000))
+                    track["mpris:length"] = dbus.Int64(int(float(d) * 1_000_000))
                 except (ValueError, TypeError):
                     pass
+        track["mpris:trackid"] = dbus.ObjectPath("/org/rpi_player/mpd/current")
 
-        shuffle = "on" if status.get("random", "0") == "1" else "off"
+        shuffle = status.get("random", "0") == "1"
         if status.get("repeat", "0") == "1":
-            repeat = "singletrack" if status.get("single", "0") == "1" else "alltracks"
+            repeat = "Track" if status.get("single", "0") == "1" else "Playlist"
         else:
-            repeat = "off"
+            repeat = "None"
 
         # Detect track change — drives whether we include Position in the push
         song_id = song.get("id", "") if song else ""
@@ -215,24 +255,41 @@ class _MediaPlayer(dbus.service.Object):
         if track_changed:
             self._last_song_id = song_id
 
-        # Compute Position (ms) — only push it on track/state changes
-        state_changed = bluez_state != str(self._props.get("Status", ""))
+        # Compute Position (ms) — push on track/state changes, and on seeks
+        state_changed = mpris_state != str(self._props.get("PlaybackStatus", ""))
         push_position = track_changed or state_changed or force
+
+        # Seek detection: if elapsed jumped more than expected drift since last push,
+        # it's a seek — push the updated position so the Camry playhead tracks correctly.
+        now_mono = time.monotonic()
+        try:
+            elapsed_f = float(status.get("elapsed", "0")) if mpd_state == "play" else 0.0
+        except (ValueError, TypeError):
+            elapsed_f = 0.0
+
+        if not push_position and self._last_push_time > 0 and mpd_state == "play":
+            expected = self._last_push_elapsed + (now_mono - self._last_push_time)
+            if abs(elapsed_f - expected) > 3.0:
+                push_position = True
+                LOG.info("Seek detected: expected=%.1fs actual=%.1fs → pushing Position",
+                         expected, elapsed_f)
+
         if push_position:
-            elapsed = status.get("elapsed", "0")
+            self._last_push_elapsed = elapsed_f
+            self._last_push_time = now_mono
             try:
-                pos_ms = dbus.UInt32(int(float(elapsed) * 1000))
+                pos_ms = dbus.Int64(int(elapsed_f * 1_000_000))
             except (ValueError, TypeError):
-                pos_ms = dbus.UInt32(0)
+                pos_ms = dbus.Int64(0)
         else:
             pos_ms = None
 
         # Accumulate changed properties
         new_props: dict[str, dbus.types.Any] = {
-            "Status":  dbus.String(bluez_state),
-            "Track":   dbus.Dictionary(track, signature="sv"),
-            "Shuffle": dbus.String(shuffle),
-            "Repeat":  dbus.String(repeat),
+            "PlaybackStatus": dbus.String(mpris_state),
+            "Metadata": dbus.Dictionary(track, signature="sv"),
+            "Shuffle": dbus.Boolean(shuffle),
+            "LoopStatus": dbus.String(repeat),
         }
         if pos_ms is not None:
             new_props["Position"] = pos_ms
@@ -244,10 +301,10 @@ class _MediaPlayer(dbus.service.Object):
                 changed[key]     = val
 
         if changed:
-            title = str(track.get("Title", "?"))
+            title = str(track.get("xesam:title", "?"))
             LOG.info("→ BlueZ AVRCP push: status=%s track=%r changed=%s",
-                     bluez_state, title, list(changed))
-            self.PropertiesChanged(_BLUEZ_PLAYER_IFACE, changed, [])
+                     mpris_state, title, list(changed))
+            self.PropertiesChanged(_MPRIS_PLAYER_IFACE, changed, [])
 
         return False  # GLib idle callback: don't repeat
 
@@ -262,7 +319,10 @@ class _BridgeManager:
     def __init__(self, bus: dbus.SystemBus, player: _MediaPlayer) -> None:
         self._bus    = bus
         self._player = player
-        self._reconnect_timers: dict[str, int] = {}  # object_path → GLib source id
+        # One pending timer per device/profile operation.  Keeping this keyed
+        # consistently prevents heartbeat and reconnect signals from stacking
+        # overlapping ConnectProfile calls.
+        self._reconnect_timers: dict[str, int] = {}
 
         # Watch for BlueZ appearing/disappearing (bluetoothd restart)
         self._bus.watch_name_owner(_BLUEZ_SVC, self._on_bluez_owner_changed)
@@ -301,11 +361,8 @@ class _BridgeManager:
                 self._bus.get_object(_BLUEZ_SVC, _ADAPTER_PATH),
                 _BLUEZ_MEDIA_IFACE,
             )
-            adapter.RegisterPlayer(
-                dbus.ObjectPath(_PLAYER_PATH),
-                {"Name": dbus.String("MPD"), "Type": dbus.String("Audio")},
-            )
-            LOG.info("Re-registered BlueZ MediaPlayer1 at %s", _PLAYER_PATH)
+            adapter.RegisterPlayer(dbus.ObjectPath(_PLAYER_PATH), self._player.registration_props())
+            LOG.info("Re-registered MPRIS player at %s", _PLAYER_PATH)
         except dbus.DBusException as exc:
             if "AlreadyExists" in str(exc):
                 # Our registration is still alive — nothing to do except push state
@@ -328,14 +385,74 @@ class _BridgeManager:
         if connected is None:
             return
         if bool(connected):
-            LOG.info("BT device connected: %s — scheduling metadata push in %d ms",
-                     path, _RECONNECT_PUSH_DELAY_MS)
+            LOG.info("BT device connected: %s — scheduling AVRCP connect (delays=%s ms), "
+                     "metadata push in %d ms",
+                     path, _AVRCP_CONNECT_DELAYS_MS, _RECONNECT_PUSH_DELAY_MS)
+            self._schedule_avrcp_connect(path)
             self._schedule_force_push(path)
         else:
             LOG.info("BT device disconnected: %s", path)
-            # Cancel any pending push timer for this device
-            if path in self._reconnect_timers:
-                GLib.source_remove(self._reconnect_timers.pop(path))
+            # Cancel any pending timers for this device
+            for key in [path, f"avrcp:{path}"]:
+                if key in self._reconnect_timers:
+                    GLib.source_remove(self._reconnect_timers.pop(key))
+
+    def _schedule_avrcp_connect(self, device_path: str, attempt: int = 0) -> None:
+        """Force BlueZ to initiate the AVCTP channel to the remote device.
+
+        Retries up to len(_AVRCP_CONNECT_DELAYS_MS) times with increasing
+        delays to handle the race where A2DP hasn't fully settled yet.
+        Stops retrying once ConnectProfile succeeds or reports AlreadyConnected.
+        """
+        if attempt >= len(_AVRCP_CONNECT_DELAYS_MS):
+            LOG.warning("AVRCP ConnectProfile: all %d attempts exhausted for %s",
+                        len(_AVRCP_CONNECT_DELAYS_MS), device_path)
+            return
+        delay = _AVRCP_CONNECT_DELAYS_MS[attempt]
+        key = f"avrcp:{device_path}"
+        if key in self._reconnect_timers:
+            return
+        timer_id = GLib.timeout_add(
+            delay,
+            lambda: self._do_avrcp_connect(device_path, key, attempt),
+        )
+        self._reconnect_timers[key] = timer_id
+        LOG.info("AVRCP ConnectProfile attempt %d scheduled in %d ms for %s",
+                 attempt + 1, delay, device_path)
+
+    def _do_avrcp_connect(self, device_path: str, key: str, attempt: int) -> bool:
+        self._reconnect_timers.pop(key, None)
+        try:
+            props = dbus.Interface(
+                self._bus.get_object(_BLUEZ_SVC, device_path),
+                _DBUS_PROPS_IFACE,
+            )
+            remote_uuids = {str(uuid).lower() for uuid in props.Get("org.bluez.Device1", "UUIDs")}
+            if _AVRCP_CONTROLLER_UUID not in remote_uuids:
+                LOG.info("AVRCP Controller UUID not yet advertised by %s (attempt %d)",
+                         device_path, attempt + 1)
+                self._schedule_avrcp_connect(device_path, attempt + 1)
+                return False
+            device = dbus.Interface(
+                self._bus.get_object(_BLUEZ_SVC, device_path),
+                "org.bluez.Device1",
+            )
+            device.ConnectProfile(_AVRCP_CONTROLLER_UUID)
+            LOG.info("AVRCP ConnectProfile attempt %d succeeded for %s",
+                     attempt + 1, device_path)
+            # Success — no further retries needed
+        except dbus.DBusException as exc:
+            err = str(exc)
+            if any(s in err for s in ("AlreadyConnected", "Already Connected", "InProgress")):
+                LOG.info("AVRCP already connected/in-progress for %s (attempt %d): %s",
+                         device_path, attempt + 1, exc)
+                # Already connected — no further retries needed
+            else:
+                LOG.warning("AVRCP ConnectProfile attempt %d failed for %s: %s",
+                            attempt + 1, device_path, exc)
+                # Schedule next retry
+                self._schedule_avrcp_connect(device_path, attempt + 1)
+        return False
 
     def _schedule_force_push(self, key: str) -> None:
         """Cancel any existing push timer for ``key`` and schedule a new one."""
@@ -356,6 +473,7 @@ class _BridgeManager:
     # ---- Heartbeat ----------------------------------------------------------
 
     def _heartbeat(self) -> bool:
+        """30-second heartbeat: re-push the state in case an event was lost."""
         LOG.debug("Heartbeat: re-pushing metadata to all AVRCP devices")
         _push_current_mpd_state(self._player, force=True)
         return True  # repeat
@@ -378,7 +496,12 @@ def _mpd_cmd(command: str, *args) -> None:
 
 
 def _push_current_mpd_state(player: _MediaPlayer, force: bool = False) -> None:
-    """Read current MPD state synchronously and push it to BlueZ."""
+    """Read current MPD state synchronously and push it to BlueZ.
+
+    ID3 fallback: if the song's title or artist tag is blank, derive them from
+    the filename using player.id3_fallback so the Camry head unit shows
+    something useful instead of "(Unknown)".
+    """
     try:
         c = _mpd.MPDClient()
         c.connect(_MPD_HOST, _MPD_PORT)
@@ -386,6 +509,21 @@ def _push_current_mpd_state(player: _MediaPlayer, force: bool = False) -> None:
         song   = c.currentsong()
         c.close()
         c.disconnect()
+        # Enrich missing ID3 tags from filename before pushing to BlueZ.
+        if song and _HAS_ID3_FALLBACK:
+            filename = song.get("file", "")
+            title = song.get("title", "")
+            artist = song.get("artist", "")
+            enriched_title, enriched_artist = _id3_enrich(title, artist, filename)
+            if enriched_title != title or enriched_artist != artist:
+                song = dict(song)
+                if enriched_title:
+                    song["title"] = enriched_title
+                if enriched_artist:
+                    song["artist"] = enriched_artist
+                elif "artist" in song:
+                    # Explicitly blank artist is better than "(Unknown)"
+                    song["artist"] = ""
         player.update_from_mpd(status, song, force=force)
     except Exception as exc:
         LOG.warning("MPD state read failed: %s", exc)
@@ -420,7 +558,8 @@ def main() -> None:
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
 
-    # Register our MediaPlayer1 object
+    # Register our MPRIS player.  BlueZ translates it to AVRCP Target for a
+    # remote AVRCP Controller such as the Camry head unit.
     player = _MediaPlayer(bus, _PLAYER_PATH)
 
     adapter = dbus.Interface(
@@ -428,11 +567,8 @@ def main() -> None:
         _BLUEZ_MEDIA_IFACE,
     )
     try:
-        adapter.RegisterPlayer(
-            dbus.ObjectPath(_PLAYER_PATH),
-            {"Name": dbus.String("MPD"), "Type": dbus.String("Audio")},
-        )
-        LOG.info("Registered BlueZ MediaPlayer1 at %s", _PLAYER_PATH)
+        adapter.RegisterPlayer(dbus.ObjectPath(_PLAYER_PATH), player.registration_props())
+        LOG.info("Registered MPRIS player at %s", _PLAYER_PATH)
     except dbus.DBusException as exc:
         LOG.error("RegisterPlayer failed: %s", exc)
         sys.exit(1)

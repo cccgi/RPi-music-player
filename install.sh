@@ -477,7 +477,7 @@ chown "$SERVICE_USER:$SERVICE_USER" "$VIDEO_DIR" "$TRASH_DIR"
 # ---------------------------------------------------------------------------
 log "Installing systemd units"
 # ---------------------------------------------------------------------------
-for unit in tourbox-player streamdeck-player shutdown-button video-mpv rpi-player-wifi-on; do
+for unit in tourbox-player streamdeck-player shutdown-button video-mpv rpi-player-wifi-on avrcp-bridge; do
     sed "s|User=pi|User=$SERVICE_USER|; s|Group=pi|Group=$SERVICE_USER|" \
         "$SRC/system/systemd/$unit.service" > "/etc/systemd/system/$unit.service"
     chmod 0644 "/etc/systemd/system/$unit.service"
@@ -485,7 +485,7 @@ done
 systemd-analyze verify /etc/systemd/system/tourbox-player.service 2>&1 | head -5 || true
 systemctl daemon-reload
 systemctl enable tourbox-player.service streamdeck-player.service video-mpv.service \
-    rpi-player-wifi-on.service
+    rpi-player-wifi-on.service avrcp-bridge.service
 # Force Wi-Fi on right now too, in case this install is re-run on a box where
 # a previous session left it off -- the new unit only guarantees this on the
 # NEXT boot otherwise.
